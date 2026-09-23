@@ -373,6 +373,15 @@ def _bot_mode_parts(agent: Any) -> list[str]:
                 _title = str((_store.sessions.get_title(_sid) if _store is not None
                               else _sdb.get_session_title(_sid)) or "").strip()
         _bot_section = get_bot_mode_protocol_section(_agent_home(agent)) if _title == BOT_CHAT_TITLE else None
+        if not _bot_section:
+            # hetz: agent.message_agent_all_sessions gives every session the tool, so give it the roster too
+            # (no epoch line / timeless flag: those belong to the eternal canonical Bot Chat only).
+            from tools.bot_mode_dm import _all_sessions_opt_in
+            if _all_sessions_opt_in(_agent_home(agent)):
+                _extra = get_bot_mode_protocol_section(_agent_home(agent))
+                if _extra:
+                    parts.append(_extra)
+                return parts
         if _bot_section:
             parts.append(_bot_section)
             # Capability epoch lets the restore path rebuild ONCE per

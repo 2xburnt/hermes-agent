@@ -135,7 +135,8 @@ def message_agent_authorized(agent: Any) -> bool:
 
         # Managed-install check, NOT section non-emptiness: a SOUL.md carrying the
         # legacy protocol text gets an empty section but must still get the tool.
-        return _session_title(agent) == BOT_CHAT_TITLE and is_bot_mode_managed(_agent_home(agent))
+        home = _agent_home(agent)
+        return _dm_session_allowed(agent, home) and is_bot_mode_managed(home)
     except Exception:  # pragma: no cover — must never break a turn
         logger.debug("message_agent_authorized failed", exc_info=True)
         return False
@@ -262,7 +263,7 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
             _profile_name as _self_profile_name, _roster, is_bot_mode_managed,
         )
 
-        if _session_title(agent) != BOT_CHAT_TITLE:
+        if not _dm_session_allowed(agent, home):
             return _err("message_agent is only available in a Bot Mode 'Bot Chat' session. "
                         "This session is not one; do not retry.")
         if not is_bot_mode_managed(home):
@@ -1041,6 +1042,24 @@ def _agent_home(agent: Any) -> str:
         if persistence is not None:
             return str(persistence.scope.profile_dir)
     return _default_home()
+
+
+def _all_sessions_opt_in(home: str) -> bool:
+    """``agent.message_agent_all_sessions: true`` in the bot's OWN config.yaml: the bot may
+    message teammates from every session (desktop chats, Slack/Telegram/Discord threads),
+    not only from its canonical Bot Chat. Local hetz patch. Never raises."""
+    with contextlib.suppress(Exception):
+        import yaml
+
+        cfg = yaml.safe_load((Path(home) / "config.yaml").read_text(encoding="utf-8")) or {}
+        return bool(((cfg.get("agent") or {}).get("message_agent_all_sessions")))
+    return False
+
+
+def _dm_session_allowed(agent: Any, home: str) -> bool:
+    from tools.bot_mode_probe import BOT_CHAT_TITLE
+
+    return _session_title(agent) == BOT_CHAT_TITLE or _all_sessions_opt_in(home)
 
 
 def _session_title(agent: Any) -> str:
