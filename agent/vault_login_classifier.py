@@ -144,11 +144,23 @@ _RE_OTP = re.compile(
 )
 
 
+_RE_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _otp_searchable(control: LoginControl) -> str:
+    # camelCase ids/names (Google's ``totpPin``, ``otpCode``, ``verificationCode``) collapse into one
+    # token under _normalize_text, so the word-bounded keywords never match; split them first. Only
+    # the OTP path does this: the login/checkout heuristics keep their existing tokenisation.
+    text = " ".join(p for p in (control.name, control.label) if p)
+    return _normalize_text(_RE_CAMEL_BOUNDARY.sub(" ", text))
+
+
 def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginControl]:
     """The controls that take a second-factor code. ``autocomplete=one-time-code`` is authoritative;
-    otherwise a text/tel/number input whose name/label says code/OTP/2FA/verification. Some sites split
-    the code into one input per digit (``maxlength=1`` boxes): they are returned in DOM order and the
-    fill spreads the code across them."""
+    otherwise a text/tel/number input whose name/label says code/OTP/2FA/verification (camelCase names
+    such as Google's ``totpPin`` are split into words first). Some sites split the code into one input
+    per digit (``maxlength=1`` boxes): they are returned in DOM order and the fill spreads the code
+    across them."""
     out: list[ClassifiedLoginControl] = []
     for c in controls:
         tokens = c.autocomplete.lower().split()
@@ -157,7 +169,7 @@ def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginC
             continue
         if c.type not in ("text", "tel", "number", "password", ""):
             continue
-        if _RE_OTP.search(_normalize_text(" ".join(p for p in (c.name, c.label) if p))):
+        if _RE_OTP.search(_otp_searchable(c)):
             out.append(ClassifiedLoginControl(c, 70, "one-time-code"))
     return out
 
