@@ -297,9 +297,21 @@ def _sdk_supports_agent_sessions() -> bool:
     return _AGENT_SESSIONS_SUPPORTED
 
 
-def _session_status_method(client: Any):
-    """Return the status setter: Agent Sessions API when available, else legacy."""
-    if _sdk_supports_agent_sessions():
+# ``agents.sessions.setStatus`` only accepts these lifecycle values; anything else
+# (free text like "is thinking...", live tool phrases, "" to clear) fails with
+# ``invalid_arguments`` (#110374).
+_AGENT_SESSION_STATUSES = frozenset({"active", "processing", "suspended", "closed"})
+
+
+def _session_status_method(client: Any, status: Optional[str] = None):
+    """Return the status setter for ``status``.
+
+    Free-text statuses and empty clears go to ``assistant.threads.setStatus`` (the
+    only API that renders a text status line; works in channel threads and Agent
+    view DMs). Only real lifecycle enum values use ``agents.sessions.setStatus``
+    when the installed slack-sdk has it.
+    """
+    if status in _AGENT_SESSION_STATUSES and _sdk_supports_agent_sessions():
         method = getattr(client, "agents_sessions_setStatus", None)
         if method is not None:
             return method
@@ -2737,7 +2749,8 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str) -> None:
         """``assistant.threads.setStatus`` (empty ``status`` clears); failures are debug-logged."""
         try:
-            _set_status = _session_status_method(self._get_client(chat_id, team_id=team_id))
+            _set_status = _session_status_method(
+                self._get_client(chat_id, team_id=team_id), status)
             await _set_status(channel_id=chat_id, thread_ts=thread_ts, status=status)
         except Exception as e:
             logger.debug("[Slack] assistant.threads.setStatus %s: %s", fail_label, e)
