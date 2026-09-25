@@ -2884,14 +2884,18 @@ def _get_channel_override(
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
-    """Hermes update/restart argv: the running interpreter's ``python -m hermes_cli.main``
-    (exactly this install), else ``hermes`` on PATH, else None. The module argv must win: a
-    PATH-first lookup lets an attacker-planted ``hermes`` shadow the running install when
-    /update or /restart re-execs it (#111569)."""
+    """Hermes update/restart argv for exactly this install, else PATH, else None.
+
+    Use the install launcher rather than bare ``sys.executable -m hermes_cli.main``: managed
+    source installs run the gateway on a bare store interpreter and activate the selected
+    dependency environment only in-process. A new bare child therefore cannot import runtime
+    dependencies. The launcher preserves the #111569 trust order while bootstrapping that env.
+    """
     try:
         import importlib.util
         if importlib.util.find_spec("hermes_cli") is not None:
-            return [sys.executable, "-m", "hermes_cli.main"]
+            from hermes_cli._launchers import installation_command
+            return installation_command(Path(__file__).resolve().parent.parent, [])
     except Exception:
         pass
     import shutil

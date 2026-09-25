@@ -1,11 +1,11 @@
 """Cron: import path of the restart-safe external worker.
 
-The worker is spawned as ``sys.executable -m cron.scheduler``. Its entry module is
-``cron.scheduler``, not ``hermes_cli.main``, so nothing bootstraps the gateway's checkout
-onto its ``sys.path``; historically it imported ``cron`` only through the implicit ``-m``
-cwd entry. That entry is gone under ``PYTHONSAFEPATH`` and useless when the venv's
-editable install maps a moved/deleted checkout -- the worker then dies with
-"No module named 'cron'" before its ownership ack (#112729, hypothesised cause).
+The worker is spawned through the install launcher as ``--run-module cron.scheduler``.
+The launcher bootstraps dependencies, while this module pins the gateway's checkout onto
+``sys.path``; historically the worker imported ``cron`` only through the implicit ``-m``
+cwd entry. That entry is gone under ``PYTHONSAFEPATH`` and useless when the venv's editable
+install maps a moved/deleted checkout -- the worker then dies with "No module named 'cron'"
+before its ownership ack (#112729, hypothesised cause).
 
 The shared subprocess sanitizer strips Hermes-owned PYTHONPATH entries because user
 children must not see our tree. This child IS Hermes, so the pin is applied *after* the

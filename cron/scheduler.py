@@ -3571,15 +3571,20 @@ def _launch_external_cron_worker(job: dict) -> bool:
     ack_path = handoff_dir / f"{execution_id}.ready"
     # Captured so a worker that dies before its acknowledgement can name the cause (#112729).
     stderr_path = handoff_dir / f"{execution_id}.stderr"
-    command = [
-        sys.executable,
-        "-m",
-        "cron.scheduler",
-        "--external-worker-file",
-        str(payload_path),
-        "--ack-file",
-        str(ack_path),
-    ]
+    # `sys.executable -m cron.scheduler` (pre-2026-09-25) never imports hermes_bootstrap, so a
+    # gateway launched by the install's own launcher (bare managed interpreter; deps live only in
+    # the PM-selected venv that hermes_bootstrap.activate_dependencies() puts on sys.path at boot)
+    # spawns a child that can't even import `ruamel` (hermes_yaml.py) before its ownership ack
+    # (local hetz fix; same bug and same resolution as kanban_db_dispatch._resolve_hermes_argv).
+    # installation_command() resolves the installed launcher's `--run-module` form when one is
+    # published (source installs), else falls back to the bootstrap-wrapped runtime_command().
+    from hermes_cli._launchers import installation_command
+    _repo_root_for_command = Path(__file__).resolve().parent.parent
+    command = installation_command(
+        _repo_root_for_command,
+        ["--external-worker-file", str(payload_path), "--ack-file", str(ack_path)],
+        module="cron.scheduler",
+    )
 
     from agent.secret_scope import is_multiplex_active
     from cron.scheduler_provider import routed_profile_fire
@@ -3658,10 +3663,10 @@ def _launch_external_cron_worker(job: dict) -> bool:
         "HERMES_EXEC_ASK",
     ):
         worker_env.pop(_presence_var, None)
-    # `-m cron.scheduler` has no hermes_cli.main bootstrap; pin this checkout explicitly
-    # (PYTHONSAFEPATH / stale editable mapping, #112729), hand the child the committed
-    # dependency generation (#122222), and mark it so its own entry runs the PM dependency
-    # boot. See cron/scheduler_worker_env.py and cron/worker_bootstrap.py.
+    # The install launcher bootstraps dependencies; also pin this checkout explicitly
+    # (PYTHONSAFEPATH / stale editable mapping, #112729) and the committed dependency
+    # generation (#122222). Keep the upstream worker boot marker so its entry point
+    # activates and leases that generation. See scheduler_worker_env.py and worker_bootstrap.py.
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
     repo_root = Path(project_root_str())
     worker_env = pin_hermes_tree_on_pythonpath(worker_env, repo_root)

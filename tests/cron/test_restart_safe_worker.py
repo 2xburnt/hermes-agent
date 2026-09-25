@@ -381,6 +381,11 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
         wrapped_commands.append((command, unit_suffix))
         return GatewayChildDispatch("scoped", ["scope", "--", *command])
 
+    install_argv = ["/exact/install/hermes", "--run-module", "cron.scheduler"]
+    monkeypatch.setattr(
+        "hermes_cli._launchers.installation_command",
+        lambda _root, args, *, module: [*install_argv, *args],
+    )
     monkeypatch.setattr(
         "tools.process_registry.restart_safe_gateway_child_argv", wrap
     )
@@ -396,6 +401,7 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     finally:
         clear_env_passthrough()
         set_multiplex_active(False)
+    assert wrapped_commands[0][0][:3] == install_argv
     assert wrapped_commands[0][1] == "cron-job-1-exec-exec-1"
     assert spawned[0][0][0:2] == ["scope", "--"]
     assert spawned[0][1]["start_new_session"] is True

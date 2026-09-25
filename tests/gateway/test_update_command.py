@@ -64,18 +64,18 @@ class TestHandleUpdateCommand:
 
     @pytest.mark.asyncio
     async def test_resolve_hermes_bin_module_argv(self):
-        """_resolve_hermes_bin uses the running interpreter's module argv when hermes_cli is
-        importable, even when PATH also offers a ``hermes`` binary (#111569: a PATH-first
-        lookup would re-exec an attacker-planted executable on /update and /restart)."""
-        import sys
+        """_resolve_hermes_bin uses this install's launcher when hermes_cli is importable,
+        even when PATH offers an attacker-planted binary (#111569)."""
         from gateway.run import _resolve_hermes_bin
 
         fake_spec = MagicMock()
+        install_argv = ["/exact/install/hermes"]
         with patch("shutil.which", return_value="/tmp/attacker/hermes"), \
-             patch("importlib.util.find_spec", return_value=fake_spec):
+             patch("importlib.util.find_spec", return_value=fake_spec), \
+             patch("hermes_cli._launchers.installation_command", return_value=install_argv):
             result = _resolve_hermes_bin()
 
-        assert result == [sys.executable, "-m", "hermes_cli.main"]
+        assert result == install_argv
 
     @pytest.mark.asyncio
     async def test_resolve_hermes_bin_falls_back_to_path_then_none(self):
