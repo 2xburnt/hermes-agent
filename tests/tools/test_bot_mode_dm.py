@@ -28,6 +28,26 @@ def _fresh_probe_cache():
     bot_mode_probe._reset_cache_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _no_install_launcher(monkeypatch):
+    """Runner/entrypoint argv tests pin the interpreter paths; the install-launcher branch has its
+    own tests below. Resolving the real launcher reads the live install manifest."""
+    monkeypatch.setattr(bot_relay, "install_launcher", lambda: None)
+
+
+def test_delivery_runner_goes_through_install_launcher(monkeypatch):
+    """A managed install's gateway runs on a bare store interpreter that cannot import the
+    runner's dependencies (ruamel), so the runner is launched via the install launcher."""
+    monkeypatch.setattr(bot_relay, "install_launcher", lambda: "/inst/.hermes/bin/hermes")
+    author = {"id": "bot:ops", "name": "Ops", "is_bot": True}
+    parts = shlex.split(bot_mode_dm._delivery_command(["hermes", "-p", "x"], "/tmp/dm", stdin_file=False,
+                                                      author=author))
+    assert parts[:3] == ["/inst/.hermes/bin/hermes", "--run-module", "tools.bot_mode_dm"]
+    at = parts.index("--run-delivery")
+    assert parts[at + 1] == "--author" and json.loads(parts[at + 2]) == author
+    assert parts[at + 3:at + 5] == ["query-file", "/tmp/dm"]
+
+
 def _managed_home(tmp_path, *, teammates=("researcher",), peers=()) -> Path:
     home = tmp_path / ".hermes"
     home.mkdir(exist_ok=True)

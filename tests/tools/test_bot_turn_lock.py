@@ -27,6 +27,12 @@ from tools import bot_mode_dm, bot_relay
 from tools.bot_relay import TurnBusyError, acquire_turn_lock, turn_lock_path
 
 
+@pytest.fixture(autouse=True)
+def _no_install_launcher(monkeypatch):
+    # Resolving the real install launcher reads the live install manifest.
+    monkeypatch.setattr(bot_relay, "install_launcher", lambda: None)
+
+
 @pytest.fixture
 def root(tmp_path):
     # Keep the lockfile path SHORT (macOS-safe).

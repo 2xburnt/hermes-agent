@@ -23,6 +23,26 @@ import pytest
 
 from tools import bot_relay
 
+_REAL_INSTALL_LAUNCHER = bot_relay.install_launcher
+
+
+@pytest.fixture(autouse=True)
+def _no_install_launcher(monkeypatch):
+    # Resolving the real install launcher reads the live install manifest.
+    monkeypatch.setattr(bot_relay, "install_launcher", lambda: None)
+
+
+def test_install_launcher_accepts_only_a_published_launcher_file(tmp_path, monkeypatch):
+    launcher = tmp_path / "hermes"
+    monkeypatch.setattr("hermes_cli._launchers.installation_command", lambda *_a, **_k: [str(launcher)])
+    assert _REAL_INSTALL_LAUNCHER() is None  # not published yet
+    launcher.touch()
+    assert _REAL_INSTALL_LAUNCHER() == str(launcher)
+    # Non-store installs get the bootstrap-wrapped interpreter argv: no launcher file to name.
+    monkeypatch.setattr("hermes_cli._launchers.installation_command",
+                        lambda *_a, **_k: ["/usr/bin/python3", "-I", "-c", "..."])
+    assert _REAL_INSTALL_LAUNCHER() is None
+
 
 ENV = {"id": "d" * 32, "target_handle": "researcher", "target_connection": "ssh-vps"}
 

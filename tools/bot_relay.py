@@ -499,6 +499,16 @@ def _hermes_cli() -> str:
     return str(sibling) if sibling.is_file() else shutil.which("hermes") or "hermes"
 
 
+def install_launcher() -> str | None:
+    """This install's published ``.hermes/bin/hermes`` launcher when the store interpreter owns
+    the runtime, else None. The launcher bootstraps the PM-selected dependency environment, which a
+    bare ``sys.executable`` child of such a gateway cannot import (``ruamel`` first)."""
+    from hermes_cli._launchers import installation_command
+
+    command = installation_command(Path(__file__).resolve().parent.parent, [])
+    return command[0] if len(command) == 1 and Path(command[0]).is_file() else None
+
+
 class DeliveryAuthor:
     """A relayed turn's author as an in-process object. ``bot_relay.deliver`` builds it from the sender fields
     an admitted gateway client relays for another connection; nothing verifies the sender itself. A JSON

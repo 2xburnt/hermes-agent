@@ -772,8 +772,14 @@ def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
                       profile_home: Path | None = None, author: Optional[dict] = None) -> str:
     """Build an argv-safe command for the cleanup-owning background runner:
     ``--run-delivery [--author <json>] <mode> <dm_file> [--profile-home <path>] <argv...>``."""
-    runner_argv = [sys.executable, str(Path(__file__).resolve()), "--run-delivery",
-                   "stdin" if stdin_file else "query-file", dm_file]
+    # Through the install launcher when there is one: the runner imports tools.bot_relay (and so
+    # ruamel via hermes_yaml), which a bare store-interpreter child cannot (local hetz fix).
+    from tools.bot_relay import install_launcher
+
+    launcher = install_launcher()
+    prefix = ([launcher, "--run-module", "tools.bot_mode_dm"] if launcher
+              else [sys.executable, str(Path(__file__).resolve())])
+    runner_argv = [*prefix, "--run-delivery", "stdin" if stdin_file else "query-file", dm_file]
     if profile_home is not None:
         runner_argv.extend(["--profile-home", str(Path(profile_home).resolve())])
     runner_argv.extend(argv)
@@ -783,7 +789,8 @@ def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
         runner_argv = [part.replace("\\", "/") for part in runner_argv]
     if author:
         # Inserted after the slash rewrite: JSON escapes are backslashes too.
-        runner_argv[3:3] = ["--author", json.dumps(author, separators=(",", ":"))]
+        at = runner_argv.index("--run-delivery") + 1
+        runner_argv[at:at] = ["--author", json.dumps(author, separators=(",", ":"))]
     return shlex.join(runner_argv)
 
 
