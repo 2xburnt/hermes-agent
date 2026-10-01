@@ -2081,6 +2081,66 @@ class TestIncomingAudioHandling:
 
 class TestMessageRouting:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("overrides,admitted", [
+        ({}, True),
+        ({"metadata": {"event_type": "owner_handoff"}}, True),
+        ({"metadata": None}, False),
+        ({"metadata": {}}, False),
+        ({"metadata": "owner_handoff"}, False),
+        ({"metadata": {"event_type": "other"}}, False),
+        ({"user": "U_OTHER"}, False),
+        ({"user": ""}, False),
+        ({"channel": "D_OTHER"}, False),
+        ({"subtype": "bot_message"}, False),
+        ({"user_profile": {"is_bot": True}}, False),
+        ({"bot_id": None}, True),
+        ({"bot_profile": None}, True),
+    ])
+    async def test_owner_handoff_is_scoped(self, adapter, overrides, admitted):
+        adapter.config.extra["api_human_users"] = ["U072NQJJ2HJ"]
+        adapter.config.extra["allow_bots"] = "none"
+        event = {
+            "type": "message", "text": "Pickup context",
+            "user": "U072NQJJ2HJ", "channel": "D0ADWS3E86S",
+            "channel_type": "im", "ts": "1234567890.000001",
+            "app_id": "A0ADGB6MNNT", "bot_id": "B0B3QSKJENP",
+            "bot_profile": {"id": "B0B3QSKJENP", "app_id": "A0ADGB6MNNT"},
+            "metadata": {"event_type": "owner_handoff",
+                         "event_payload": {"source": "cos-priorities"}},
+            **overrides,
+        }
+        assert adapter._event_declares_bot_sender(event) is (not admitted)
+        await adapter._handle_slack_message(event)
+        if admitted:
+            adapter.handle_message.assert_called_once()
+            message = adapter.handle_message.call_args[0][0]
+            assert message.source.user_id == "U072NQJJ2HJ"
+            assert message.source.is_bot is False
+        else:
+            adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_owner_handoff_cannot_override_bot_user_lookup(self, adapter):
+        adapter.config.extra["api_human_users"] = ["U072NQJJ2HJ"]
+        adapter._app.client.users_info = AsyncMock(return_value={"user": {"is_bot": True}})
+        await adapter._handle_slack_message({
+            "type": "message", "text": "Pickup context", "user": "U072NQJJ2HJ",
+            "channel": "D0ADWS3E86S", "ts": "1234567890.000001",
+            "bot_id": "B0B3QSKJENP", "metadata": {"event_type": "owner_handoff"},
+        })
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_owner_handoff_requires_allowlist(self, adapter):
+        adapter.config.extra["api_human_users"] = []
+        await adapter._handle_slack_message({
+            "type": "message", "text": "Pickup context", "user": "U072NQJJ2HJ",
+            "channel": "D0ADWS3E86S", "ts": "1234567890.000001",
+            "bot_id": "B0B3QSKJENP", "metadata": {"event_type": "owner_handoff"},
+        })
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_dm_processed_without_mention(self, adapter):
         """DM messages should be processed without requiring a bot mention."""
         event = {

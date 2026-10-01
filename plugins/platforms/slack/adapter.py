@@ -2867,10 +2867,23 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
 
     def _event_declares_bot_sender(self, event: dict) -> bool:
         """Return True when the Slack event itself identifies a bot sender."""
-        if event.get("bot_id") or event.get("bot_profile") or event.get("subtype") == "bot_message":
+        if event.get("subtype") == "bot_message":
             return True
         profile = event.get("user_profile")
         if isinstance(profile, dict) and bool(profile.get("is_bot")):
+            return True
+        # Local owner handoffs use xoxp, but Slack stamps them with the app's bot_id/profile.
+        # Only the explicit marker in the owner's DM exempts those stamps; ordinary API sends
+        # and genuine bot users still go through the existing bot gates (including users.info).
+        metadata = event.get("metadata")
+        if (
+            event.get("channel") == "D0ADWS3E86S"
+            and isinstance(metadata, dict)
+            and metadata.get("event_type") == "owner_handoff"
+            and event.get("user") in self._slack_api_human_users()
+        ):
+            return False
+        if event.get("bot_id") or event.get("bot_profile"):
             return True
         # App-originated events may lack bot_id/subtype but carry app_id and no client_msg_id
         # (humans have one) → bot-authored unless the user is in _slack_api_human_users
