@@ -1,0 +1,144 @@
+From 9dbe1beebd5497b675cf337aac26f584c469058e Mon Sep 17 00:00:00 2001
+From: 2xburnt <169301814+2xburnt@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 22:54:45 +0200
+Subject: [PATCH] local(hetz): open Kanban card links before saved chat restore
+
+---
+ docs/kanban-deep-links.md       | 17 ++++++++++
+ static/boot.js                  |  6 ++++
+ static/panels.js                | 13 ++++++++
+ tests/kanban_deep_link.test.cjs | 57 +++++++++++++++++++++++++++++++++
+ 4 files changed, 93 insertions(+)
+ create mode 100644 docs/kanban-deep-links.md
+ create mode 100644 tests/kanban_deep_link.test.cjs
+
+diff --git a/docs/kanban-deep-links.md b/docs/kanban-deep-links.md
+new file mode 100644
+index 00000000..49d4551d
+--- /dev/null
++++ b/docs/kanban-deep-links.md
+@@ -0,0 +1,17 @@
++# Kanban card links
++
++Open `/?panel=kanban&task=t_0123abcd` to show the Kanban panel and load that
++card's detail. `?task=t_0123abcd` is also accepted. `?panel=kanban` opens the
++board without selecting a card. Task IDs must be `t_` plus eight lowercase
++hexadecimal digits; malformed values are ignored, not treated as paths.
++
++The explicit URL takes precedence over a saved chat at boot. It does not
++modify the saved conversation or create a new chat. Missing/deleted cards
++use the existing Kanban error toast. The current Kanban board selection
++still applies; links do not switch boards or profiles.
++
++The existing login `next` redirect preserves the full path and query.
++No authentication bypass or backend route is added. `/kanban` is not a
++WebUI route (it is a route on the separate Hermes dashboard).
++
++Regression command: `node --test tests/kanban_deep_link.test.cjs`.
+diff --git a/static/boot.js b/static/boot.js
+index 06c3888d..439de96c 100644
+--- a/static/boot.js
++++ b/static/boot.js
+@@ -3748,6 +3748,12 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
+   const _srch = document.getElementById('sessionSearch'); if (_srch) _srch.value = '';
+   if (typeof syncSessionSearchClear === 'function') syncSessionSearchClear();
+   if(typeof refreshProviderQuotaIndicator==='function') refreshProviderQuotaIndicator();
++  // Explicit card links win over saved conversations and PWA chat actions.
++  if (typeof openKanbanDeepLink === 'function' && await openKanbanDeepLink()) {
++    S._bootReady=true;
++    if(typeof startGatewaySSE==='function') startGatewaySSE();
++    return;
++  }
+   const urlSession=(typeof _sessionIdFromLocation==='function')?_sessionIdFromLocation():null;
+   const pwaLaunchAction=(window.HermesPWA&&typeof window.HermesPWA.launchAction==='function')
+     ? window.HermesPWA.launchAction()
+diff --git a/static/panels.js b/static/panels.js
+index 9215cc77..2540294e 100644
+--- a/static/panels.js
++++ b/static/panels.js
+@@ -471,6 +471,19 @@ async function switchPanel(name, opts = {}) {
+   return true;
+ }
+ 
++// local(hetz): resolve a Kanban link after boot/profile initialization, before
++// saved-chat restoration can change the URL or replace the main content view.
++async function openKanbanDeepLink() {
++  const params = new URLSearchParams(window.location.search);
++  const taskId = params.get('task');
++  const validTask = /^t_[0-9a-f]{8}$/.test(taskId || '');
++  const panel = params.get('panel');
++  if (panel !== 'kanban' && (panel || !validTask)) return false;
++  if (!await switchPanel('kanban')) return false;
++  if (validTask) await loadKanbanTask(taskId);
++  return true;
++}
++
+ // ── Cron panel ──
+ function _isRecurringCronJob(job) {
+   const kind = job && job.schedule && job.schedule.kind;
+diff --git a/tests/kanban_deep_link.test.cjs b/tests/kanban_deep_link.test.cjs
+new file mode 100644
+index 00000000..719a1785
+--- /dev/null
++++ b/tests/kanban_deep_link.test.cjs
+@@ -0,0 +1,57 @@
++// Run with node --test tests/kanban_deep_link.test.cjs (no npm dependencies).
++const {test} = require('node:test');
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const path = require('node:path');
++const vm = require('node:vm');
++const root = path.resolve(__dirname, '..');
++
++function panels(search, allowed = true) {
++  const calls = [];
++  const context = vm.createContext({
++    URLSearchParams, URL, console, setInterval() {}, clearInterval() {}, setTimeout() {}, clearTimeout() {},
++    window: {location: {search}, addEventListener() {}},
++    document: {addEventListener() {}, querySelectorAll() { return []; }, getElementById() { return null; }},
++    $() { return {addEventListener() {}}; },
++    localStorage: {getItem() { return null; }},
++  });
++  vm.runInContext(fs.readFileSync(path.join(root, 'static/panels.js'), 'utf8'), context);
++  context.switchPanel = async name => { calls.push(['panel', name]); await Promise.resolve(); return allowed; };
++  context.loadKanbanTask = async id => { calls.push(['task', id]); };
++  return {context, calls};
++}
++for (const [query, expected] of [
++  ['?panel=kanban&task=t_4306f854', [['panel', 'kanban'], ['task', 't_4306f854']]],
++  ['?task=t_4306f854', [['panel', 'kanban'], ['task', 't_4306f854']]],
++  ['?panel=kanban', [['panel', 'kanban']]],
++  ['?panel=kanban&task=../../bad', [['panel', 'kanban']]],
++  ['?panel=kanban&task=%3Cscript%3E', [['panel', 'kanban']]],
++  ['?panel=chat&task=t_4306f854', []],
++  ['?task=t_BAD', []],
++  ['', []],
++]) {
++  test('panel selection ' + query, async () => {
++    const {context, calls} = panels(query);
++    assert.equal(await context.openKanbanDeepLink(), expected.length > 0);
++    assert.deepEqual(calls, expected);
++  });
++}
++test('blocked panel switch does not load the task', async () => {
++  const {context, calls} = panels('?panel=kanban&task=t_4306f854', false);
++  assert.equal(await context.openKanbanDeepLink(), false);
++  assert.deepEqual(calls, [['panel', 'kanban']]);
++});
++test('login preserves the complete card target', async () => {
++  let submit;
++  const target = '/?panel=kanban&task=t_4306f854';
++  const form = {getAttribute() { return null; }, addEventListener(name, fn) { if (name === 'submit') submit = fn; }};
++  const context = vm.createContext({
++    URL, console,
++    window: {location: {href: 'https://example.test/login?next=' + encodeURIComponent(target)}},
++    document: {addEventListener(name, fn) { fn(); }, getElementById(id) { return id === 'login-form' ? form : id === 'pw' ? {value: 'test-only', addEventListener() {}} : null; }},
++    fetch: async () => ({ok: true, json: async () => ({ok: true})}),
++  });
++  vm.runInContext(fs.readFileSync(path.join(root, 'static/login.js'), 'utf8'), context);
++  await submit({preventDefault() {}});
++  assert.equal(context.window.location.href, target);
++});
+-- 
+2.53.0
+

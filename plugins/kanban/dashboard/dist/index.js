@@ -650,7 +650,12 @@
     const [laneByProfile, setLaneByProfile] = useState(true);
     const [configApplied, setConfigApplied] = useState(false);
 
-    const [selectedTaskId, setSelectedTaskId] = useState(null);
+    // dist/index.js is the hand-written source: there is no generated bundle.
+    // Resolve the card independently of board filters (including archived cards).
+    const [selectedTaskId, setSelectedTaskId] = useState(() => {
+      const taskId = new URLSearchParams(window.location.search).get("task");
+      return /^t_[0-9a-f]{8}$/.test(taskId || "") ? taskId : null;
+    });
     const [selectedIds, setSelectedIds] = useState(() => new Set());
     const [lastSelectedId, setLastSelectedId] = useState(null);
     const [failedIds, setFailedIds] = useState(() => new Set());
