@@ -1570,9 +1570,11 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
-    handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
+    (PR URL in a recent comment; re-spawning risks a duplicate PR — unless an
+    explicit unblock/queue move is awaiting its next claim, or a handoff event
+    followed the comment: the named profile must work on that PR). Operator
+    requeues also admit their follow-up PR context comments, until claimed.
+    The review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
     """
@@ -1638,6 +1640,14 @@ def check_respawn_guard(
     if success is not None and not any(_rows_since(
             conn, "task_events", task_id, success, "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed')")):
         return "recent_success"
+
+    # An explicit unblock/queue move authorizes the next claim even when its
+    # explanatory comment links a PR AFTER the requeue. Do not add GitHub I/O
+    # here: this guard executes on every dispatch tick under the board lock.
+    from hermes_cli.kanban_respawn_policy import has_pending_operator_requeue
+
+    if has_pending_operator_requeue(conn, task_id):
+        return None
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     #    Exception: a handoff AFTER the newest PR comment (operator reassign,
