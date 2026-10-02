@@ -45,6 +45,9 @@ including --no-update; a missing test/patch is a hard failure with this recipe.
 
 ## Verification
 
+For the automatic specifier's block-loop escalation guard and its post-update
+checks, see [Hetz block-loop triage retention](hetz-kanban-block-loop.md).
+
     node --test tests/plugins/kanban_deep_link.test.cjs
     node --test ~/src/hermes-webui/tests/kanban_deep_link.test.cjs
 
