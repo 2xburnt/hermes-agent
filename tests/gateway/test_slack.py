@@ -2091,6 +2091,7 @@ class TestMessageRouting:
         ({"user": "U_OTHER"}, False),
         ({"user": ""}, False),
         ({"channel": "D_OTHER"}, False),
+        ({"channel": "D0ADWS3E86S"}, False),
         ({"subtype": "bot_message"}, False),
         ({"user_profile": {"is_bot": True}}, False),
         ({"bot_id": None}, True),
@@ -2101,7 +2102,7 @@ class TestMessageRouting:
         adapter.config.extra["allow_bots"] = "none"
         event = {
             "type": "message", "text": "Pickup context",
-            "user": "U072NQJJ2HJ", "channel": "D0ADWS3E86S",
+            "user": "U072NQJJ2HJ", "channel": "D0C4S9L5HJL",
             "channel_type": "im", "ts": "1234567890.000001",
             "app_id": "A0ADGB6MNNT", "bot_id": "B0B3QSKJENP",
             "bot_profile": {"id": "B0B3QSKJENP", "app_id": "A0ADGB6MNNT"},
@@ -2125,7 +2126,7 @@ class TestMessageRouting:
         adapter._app.client.users_info = AsyncMock(return_value={"user": {"is_bot": True}})
         await adapter._handle_slack_message({
             "type": "message", "text": "Pickup context", "user": "U072NQJJ2HJ",
-            "channel": "D0ADWS3E86S", "ts": "1234567890.000001",
+            "channel": "D0C4S9L5HJL", "ts": "1234567890.000001",
             "bot_id": "B0B3QSKJENP", "metadata": {"event_type": "owner_handoff"},
         })
         adapter.handle_message.assert_not_called()
@@ -2135,7 +2136,7 @@ class TestMessageRouting:
         adapter.config.extra["api_human_users"] = []
         await adapter._handle_slack_message({
             "type": "message", "text": "Pickup context", "user": "U072NQJJ2HJ",
-            "channel": "D0ADWS3E86S", "ts": "1234567890.000001",
+            "channel": "D0C4S9L5HJL", "ts": "1234567890.000001",
             "bot_id": "B0B3QSKJENP", "metadata": {"event_type": "owner_handoff"},
         })
         adapter.handle_message.assert_not_called()

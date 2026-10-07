@@ -2877,7 +2877,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         # and genuine bot users still go through the existing bot gates (including users.info).
         metadata = event.get("metadata")
         if (
-            event.get("channel") == "D0ADWS3E86S"
+            event.get("channel") == "D0C4S9L5HJL"
             and isinstance(metadata, dict)
             and metadata.get("event_type") == "owner_handoff"
             and event.get("user") in self._slack_api_human_users()
