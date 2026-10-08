@@ -32,6 +32,7 @@ def setup(adapter, tmp_path, monkeypatch):
     adapter._bot_user_id = route.BOT
     adapter.config.extra.update(api_human_users=[route.OWNER], allow_bots="all")
     client = adapter._app.client
+    client.chat_postMessage.return_value = {"ok": True, "ts": "1791479902.000001"}
     client.users_info.return_value = {"ok": True, "user": {"is_bot": False}}
     client.conversations_info.return_value = {"ok": True, "channel": {
         "id": route.CHANNEL, "is_private": True, "is_im": False, "is_mpim": False,
@@ -180,6 +181,7 @@ async def test_api_errors_fail_closed(setup, method):
     await a._handle_slack_message(event)
     assert comments(home, card) == []
     a.handle_message.assert_not_awaited()
+    a._app.client.chat_postMessage.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -281,6 +283,102 @@ def test_map_ambiguity_is_logged(setup, caplog):
     assert "ambiguous owner card-thread" in caplog.text
 
 
+def set_status(home, card, status):
+    with connect_closing(home.parent.parent / "kanban.db") as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, card))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["done", "archived"])
+@pytest.mark.parametrize("live", ["todo", "ready", "running", "blocked", "review", "triage", "scheduled"])
+async def test_multi_card_root_routes_only_live_card(setup, monkeypatch, terminal, live):
+    a, event, home, card, other, mapping = setup
+    set_status(home, card, live)
+    set_status(home, other, terminal)
+    # A selected alternate board must not change the default-board resolution.
+    alternate = home.parent.parent / "alternate.db"
+    with connect_closing(alternate):
+        pass  # initialize an empty alternate board
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(alternate))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "alternate")
+    mapping.write_text(json.dumps({other: ROOT, card: ROOT, "disc:test": ROOT}))
+    await a._handle_slack_message(event)
+    assert len(comments(home, card)) == 1
+    assert comments(home, other) == []
+    a.handle_message.assert_awaited_once()
+    assert a.handle_message.await_args.args[0].metadata["owner_card_thread"] == card
+    a._app.client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["unmapped", "two_live", "zero_live", "missing_card"])
+async def test_verified_mapping_rejection_replies_in_thread_once(setup, kind):
+    a, event, home, card, other, mapping = setup
+    mapping.write_text(json.dumps({} if kind == "unmapped" else {card: ROOT, other: ROOT}))
+    if kind == "missing_card":
+        mapping.write_text(json.dumps({"t_00000000": ROOT}))
+    if kind == "zero_live":
+        set_status(home, card, "done")
+        set_status(home, other, "archived")
+    await a._handle_slack_message(event)
+    await a._handle_slack_message(event)  # Slack delivery dedup
+    assert comments(home, card) == comments(home, other) == []
+    a.handle_message.assert_not_awaited()
+    a._app.client.chat_postMessage.assert_awaited_once_with(
+        channel=route.CHANNEL, thread_ts=ROOT,
+        text="couldn't tie this to one card; reply in the DM",
+        reply_broadcast=False, unfurl_links=False, unfurl_media=False)
+    a._app.client.conversations_history.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["users_info", "conversations_info", "conversations_members", "conversations_history"])
+async def test_unmapped_verification_failure_stays_silent(setup, method):
+    a, event, home, card, other, mapping = setup
+    mapping.write_text("{}")
+    getattr(a._app.client, method).return_value = {"ok": False}
+    await a._handle_slack_message(event)
+    a.handle_message.assert_not_awaited()
+    a._app.client.chat_postMessage.assert_not_awaited()
+    assert comments(home, card) == comments(home, other) == []
+
+
+@pytest.mark.asyncio
+async def test_live_status_rechecked_after_slack_calls(setup):
+    a, event, home, card, other, mapping = setup
+    mapping.write_text(json.dumps({card: ROOT, other: ROOT}))
+    set_status(home, other, "done")
+    result = a._app.client.conversations_history.return_value
+    async def changed(**kwargs):
+        set_status(home, card, "done")
+        set_status(home, other, "blocked")
+        return result
+    a._app.client.conversations_history.side_effect = changed
+    await a._handle_slack_message(event)
+    assert comments(home, card) == comments(home, other) == []
+    a.handle_message.assert_not_awaited()
+    a._app.client.chat_postMessage.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["exception", "not_ok"])
+async def test_fallback_send_failure_allows_retry(setup, failure):
+    a, event, _, _, _, mapping = setup
+    mapping.write_text("{}")
+    client = a._app.client
+    if failure == "exception":
+        client.chat_postMessage.side_effect = RuntimeError("offline")
+    else:
+        client.chat_postMessage.return_value = {"ok": False}
+    with pytest.raises(RuntimeError):
+        await a._handle_slack_message(event)
+    client.chat_postMessage.side_effect = None
+    client.chat_postMessage.return_value = {"ok": True}
+    await a._handle_slack_message(event)
+    assert client.chat_postMessage.await_count == 2
+    a.handle_message.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_profile_and_bot_identity_guards(setup):
     a, event, home, card, _, _ = setup
@@ -291,3 +389,33 @@ async def test_profile_and_bot_identity_guards(setup):
     assert await route.route_owner_card_reply(a, event, "") is True
     assert comments(home, card) == []
     a.handle_message.assert_not_awaited()
+    a._app.client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.parametrize("status", ["done", "archived"])
+def test_single_terminal_card_keeps_existing_binding(setup, status):
+    _, _, home, card, _, _ = setup
+    set_status(home, card, status)
+    assert route.mapped_card(home, ROOT) == card
+
+
+@pytest.mark.parametrize("board_state", ["missing", "malformed"])
+def test_mapping_lookup_fails_closed_without_creating_board(setup, board_state):
+    _, _, home, card, other, mapping = setup
+    mapping.write_text(json.dumps({card: ROOT, other: ROOT}))
+    db = home.parent.parent / "kanban.db"
+    db.unlink()
+    if board_state == "malformed":
+        db.write_text("not sqlite")
+    assert route.mapped_card(home, ROOT) is None
+    assert db.exists() == (board_state == "malformed")
+
+
+@pytest.mark.asyncio
+async def test_card_removed_before_record_gets_fallback(setup, monkeypatch):
+    a, event, home, card, _, _ = setup
+    monkeypatch.setattr(kb, "get_task", lambda conn, task_id: None)
+    await a._handle_slack_message(event)
+    assert comments(home, card) == []
+    a.handle_message.assert_not_awaited()
+    a._app.client.chat_postMessage.assert_awaited_once()

@@ -10,6 +10,8 @@ import asyncio
 import json
 import logging
 import re
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 from gateway.platforms.event import MessageEvent
@@ -26,6 +28,10 @@ _TS = re.compile(r"[0-9]{9,11}\.[0-9]{6}")
 _CARD = re.compile(r"t_[0-9a-f]{8}")
 
 
+class UnmappedCardThread(Exception):
+    """Slack identity is verified, but the root has no stable, unique card."""
+
+
 def mapped_card(home: Path, thread_ts: str) -> str | None:
     """Only literal card keys count; reports/home-* keys cannot authorize routing."""
     try:
@@ -36,14 +42,34 @@ def mapped_card(home: Path, thread_ts: str) -> str | None:
         return None
     cards = [key for key, value in data.items()
              if _CARD.fullmatch(key) and value == thread_ts]
+    if not cards:
+        return None
+    # Follow-ups retain their terminal parent's root. Only the default board
+    # can disambiguate them; never pick by map order or the process's board env.
+    db_uri = (home.parent.parent / "kanban.db").resolve().as_uri() + "?mode=ro"
+    try:
+        with closing(sqlite3.connect(db_uri, uri=True, timeout=1)) as conn:
+            rows = list(conn.execute(
+                f"SELECT id, status FROM tasks WHERE id IN ({','.join('?' for _ in cards)})",
+                cards))
+    except (OSError, sqlite3.Error):
+        logger.warning("[Slack] owner card-thread board lookup failed closed", exc_info=True)
+        return None
+    # Keep the existing ability to follow up on a single terminal card, but a
+    # stale key for a deleted/nonexistent card must receive the same fallback.
+    if len(cards) == 1:
+        return rows[0][0] if rows else None
+    live = [card for card, status in rows if status not in {"done", "archived"}]
+    if len(live) == 1:
+        return live[0]
     # An ambiguous root must never fan out an owner instruction to several cards.
-    if len(cards) > 1:
-        logger.warning("[Slack] ambiguous owner card-thread root=%s cards=%s", thread_ts, cards)
-    return cards[0] if len(cards) == 1 else None
+    logger.warning("[Slack] ambiguous owner card-thread root=%s cards=%s live=%s",
+                   thread_ts, cards, live)
+    return None
 
 
 async def verified_card(adapter, event: dict, team_id: str, home: Path) -> str | None:
-    """Fresh Slack checks on EVERY reply; errors/rate limits fail closed."""
+    """Fail closed; only fully verified mapping failures raise UnmappedCardThread."""
     ts, root_ts = event.get("ts", ""), event.get("thread_ts", "")
     if (event.get("channel") != CHANNEL or event.get("user") != OWNER
             or not isinstance(ts, str) or not isinstance(root_ts, str)
@@ -54,9 +80,7 @@ async def verified_card(adapter, event: dict, team_id: str, home: Path) -> str |
     bot_uid = adapter._team_bot_user_ids.get(team_id, adapter._bot_user_id)
     if bot_uid != BOT:
         return None
-    card = mapped_card(home, root_ts)
-    if card is None:
-        return None
+    card = await asyncio.to_thread(mapped_card, home, root_ts)
     client = adapter._get_client(CHANNEL, team_id=team_id or None)
     try:
         # Unlike the general allow_bots gate, this route never admits bot users.
@@ -87,8 +111,12 @@ async def verified_card(adapter, event: dict, team_id: str, home: Path) -> str |
     except Exception:
         logger.warning("[Slack] owner card-thread verification failed closed", exc_info=True)
         return None
-    # The relay can replace its map while Slack calls are in flight.
-    return card if mapped_card(home, root_ts) == card else None
+    # The relay and card status can change while Slack calls are in flight.
+    # Do not rebind mid-reply. Only now is it safe to send a fallback in-thread.
+    current = await asyncio.to_thread(mapped_card, home, root_ts)
+    if card is None or current != card:
+        raise UnmappedCardThread
+    return card
 
 
 def record_reply(home: Path, card: str, event: dict) -> int | None:
@@ -102,7 +130,7 @@ def record_reply(home: Path, card: str, event: dict) -> int | None:
     # Resolve from the owning profile, not the process's currently selected board.
     with connect_closing(home.parent.parent / "kanban.db") as conn:
         if kb.get_task(conn, card) is None:
-            return None
+            raise UnmappedCardThread
         # Cross-card source dedup preserves the original binding across relay remaps.
         # A comment without a wake receipt is pending, not completed: replay retries it.
         with kb.write_txn(conn):
@@ -130,11 +158,29 @@ async def route_owner_card_reply(adapter, event: dict, team_id: str) -> bool:
     if event.get("channel") != CHANNEL or adapter._owner_profile != PROFILE:
         return False
     home = get_profile_dir(PROFILE)
-    card = await verified_card(adapter, event, team_id, home)
+    try:
+        card = await verified_card(adapter, event, team_id, home)
+        comment_id = (await asyncio.to_thread(record_reply, home, card, event)
+                      if card is not None else None)
+    except UnmappedCardThread:
+        client = adapter._get_client(CHANNEL, team_id=team_id or None)
+        try:
+            response = await client.chat_postMessage(
+                channel=CHANNEL, thread_ts=event["thread_ts"],
+                text="couldn't tie this to one card; reply in the DM",
+                reply_broadcast=False, unfurl_links=False, unfurl_media=False)
+            if not response.get("ok"):
+                raise RuntimeError("owner card-thread fallback was not sent")
+        except BaseException:
+            event_ts = event.get("_slack_changed_event_ts") or event["ts"]
+            adapter._dedup.discard(adapter._workspace_event_id(team_id, event_ts))
+            raise
+        logger.info("[Slack] owner card-thread mapping rejected with fallback channel=%s ts=%s",
+                    CHANNEL, event["ts"])
+        return True
     if card is None:
         logger.info("[Slack] owner card-thread rejected channel=%s ts=%s", CHANNEL, event.get("ts"))
         return True
-    comment_id = await asyncio.to_thread(record_reply, home, card, event)
     if comment_id is None:
         return True
     logger.info("[Slack] owner card-thread routed channel=%s ts=%s card=%s comment=%s",
