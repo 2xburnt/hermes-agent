@@ -4750,6 +4750,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         if self._early_reject_unauthorized(
                 user_id, channel_id, is_dm, thread_id=thread_ts, is_bot=sender_is_bot):
             return
+        from .owner_card_threads import route_owner_card_reply
+        if await route_owner_card_reply(self, event, team_id):
+            return
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         # Mentions may live only in Block Kit blocks.
         # See #52387.

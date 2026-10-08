@@ -1,0 +1,167 @@
+"""Hetz-only owner ingress for ChiefOfBots' private card-thread channel.
+
+Do not turn this into a generic mention exemption: unmapped/unsafe messages are
+consumed, never handed to an LLM that could infer a card from their text. The DM
+path and its owner_handoff exception are deliberately unchanged.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+from pathlib import Path
+
+from gateway.platforms.event import MessageEvent
+from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_db_connect import connect_closing
+from hermes_cli.profiles import get_profile_dir
+
+logger = logging.getLogger(__name__)
+CHANNEL = "C0C7T7SJ866"
+OWNER = "U072NQJJ2HJ"
+BOT = "U0C3ZSP1K09"
+PROFILE = "chiefofbots"
+_TS = re.compile(r"[0-9]{9,11}\.[0-9]{6}")
+_CARD = re.compile(r"t_[0-9a-f]{8}")
+
+
+def mapped_card(home: Path, thread_ts: str) -> str | None:
+    """Only literal card keys count; reports/home-* keys cannot authorize routing."""
+    try:
+        data = json.loads((home / "relay" / f"threads.{CHANNEL}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    cards = [key for key, value in data.items()
+             if _CARD.fullmatch(key) and value == thread_ts]
+    # An ambiguous root must never fan out an owner instruction to several cards.
+    if len(cards) > 1:
+        logger.warning("[Slack] ambiguous owner card-thread root=%s cards=%s", thread_ts, cards)
+    return cards[0] if len(cards) == 1 else None
+
+
+async def verified_card(adapter, event: dict, team_id: str, home: Path) -> str | None:
+    """Fresh Slack checks on EVERY reply; errors/rate limits fail closed."""
+    ts, root_ts = event.get("ts", ""), event.get("thread_ts", "")
+    if (event.get("channel") != CHANNEL or event.get("user") != OWNER
+            or not isinstance(ts, str) or not isinstance(root_ts, str)
+            or not _TS.fullmatch(ts) or not _TS.fullmatch(root_ts) or root_ts == ts
+            or adapter._event_declares_bot_sender(event)
+            or event.get("_hermes_force_process")):
+        return None
+    bot_uid = adapter._team_bot_user_ids.get(team_id, adapter._bot_user_id)
+    if bot_uid != BOT:
+        return None
+    card = mapped_card(home, root_ts)
+    if card is None:
+        return None
+    client = adapter._get_client(CHANNEL, team_id=team_id or None)
+    try:
+        # Unlike the general allow_bots gate, this route never admits bot users.
+        user = await client.users_info(user=OWNER)
+        if not user.get("ok") or user.get("user", {}).get("is_bot") is not False:
+            return None
+        info = await client.conversations_info(channel=CHANNEL)
+        channel = info.get("channel") or {}
+        if (not info.get("ok") or channel.get("id") != CHANNEL
+                or channel.get("is_private") is not True
+                or channel.get("is_im") or channel.get("is_mpim")
+                or any(channel.get(k) for k in (
+                    "is_archived", "is_shared", "is_ext_shared", "is_org_shared",
+                    "is_pending_ext_shared", "pending_shared"))):
+            return None
+        members = await client.conversations_members(channel=CHANNEL, limit=20)
+        if (not members.get("ok") or sorted(members.get("members") or []) != sorted([OWNER, BOT])
+                or (members.get("response_metadata") or {}).get("next_cursor")):
+            return None
+        # history can fetch the parent with the bot's groups:history scope; replies
+        # for a private channel would require a user token. Never trust root caches.
+        history = await client.conversations_history(
+            channel=CHANNEL, oldest=root_ts, latest=root_ts, inclusive=True, limit=1)
+        roots = history.get("messages") or []
+        if (not history.get("ok") or len(roots) != 1
+                or roots[0].get("ts") != root_ts or roots[0].get("user") != BOT):
+            return None
+    except Exception:
+        logger.warning("[Slack] owner card-thread verification failed closed", exc_info=True)
+        return None
+    # The relay can replace its map while Slack calls are in flight.
+    return card if mapped_card(home, root_ts) == card else None
+
+
+def record_reply(home: Path, card: str, event: dict) -> int | None:
+    """Write once on the shared default board; a comment also steers a live worker."""
+    source = f"slack:{CHANNEL}:{event['thread_ts']}:{event['ts']}"
+    text = str(event.get("text") or "")
+    body = (f"requested-by: twiceburnt (slack:{OWNER}) · trust: owner\n"
+            f"source: {source}\n\n"
+            "twiceburnt replied in the card thread (not send approval):\n> "
+            + text.replace("\n", "\n> "))
+    # Resolve from the owning profile, not the process's currently selected board.
+    with connect_closing(home.parent.parent / "kanban.db") as conn:
+        if kb.get_task(conn, card) is None:
+            return None
+        # Cross-card source dedup preserves the original binding across relay remaps.
+        # A comment without a wake receipt is pending, not completed: replay retries it.
+        with kb.write_txn(conn):
+            prefix = body.split("\n\n", 1)[0] + "\n\n"
+            prior = conn.execute(
+                "SELECT id, task_id FROM task_comments WHERE author=? AND substr(body,1,?)=?",
+                (f"slack:{OWNER}", len(prefix), prefix)).fetchone()
+            if prior is not None:
+                if prior["task_id"] != card:
+                    return None
+                delivered = conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id=? AND kind='slack_owner_reply_woken' "
+                    "AND json_extract(payload, '$.comment_id')=?", (card, prior["id"])).fetchone()
+                return None if delivered else prior["id"]
+            return kb.add_comment(conn, card, f"slack:{OWNER}", body)
+
+
+def record_wake(home: Path, card: str, comment_id: int) -> None:
+    with connect_closing(home.parent.parent / "kanban.db") as conn, kb.write_txn(conn):
+        kb._append_event(conn, card, "slack_owner_reply_woken", {"comment_id": comment_id})
+
+
+async def route_owner_card_reply(adapter, event: dict, team_id: str) -> bool:
+    """True = this special channel was consumed (including denied replies)."""
+    if event.get("channel") != CHANNEL or adapter._owner_profile != PROFILE:
+        return False
+    home = get_profile_dir(PROFILE)
+    card = await verified_card(adapter, event, team_id, home)
+    if card is None:
+        logger.info("[Slack] owner card-thread rejected channel=%s ts=%s", CHANNEL, event.get("ts"))
+        return True
+    comment_id = await asyncio.to_thread(record_reply, home, card, event)
+    if comment_id is None:
+        return True
+    logger.info("[Slack] owner card-thread routed channel=%s ts=%s card=%s comment=%s",
+                CHANNEL, event["ts"], card, comment_id)
+    source = adapter.build_source(
+        chat_id=CHANNEL, chat_name="chief-of-bots", chat_type="group",
+        user_id=OWNER, user_name="twiceburnt", thread_id=event["thread_ts"],
+        scope_id=team_id or None, is_bot=False)
+    # Same ChiefOfBots card-thread workflow as the DM, but the card binding and
+    # durable owner comment are decided in code, not inferred from message text.
+    wake = MessageEvent(
+        text=(f"[Verified card-thread reply: {card}; owner comment {comment_id} already recorded.]\n"
+              f"Read only card {card}. Do not duplicate the comment or route to another card. "
+              "Use the existing card-threads workflow to notify its assignee (do not message "
+              "yourself or duplicate a running worker). Interpret any unblock request using "
+              "that card's context; do not automatically unblock. Reply here with a brief "
+              "routing acknowledgment. This is NOT approval to send: sends still require a Send tap."),
+        source=source, message_id=event["ts"], raw_message=event,
+        allow_gateway_control=False, reply_expected=True,
+        metadata={"owner_card_thread": card, "owner_comment_id": comment_id})
+    try:
+        await adapter.handle_message(wake)
+        if not wake._gateway_accepted:
+            raise RuntimeError("owner card-thread wake was not admitted")
+        await asyncio.to_thread(record_wake, home, card, comment_id)
+    except BaseException:
+        event_ts = event.get("_slack_changed_event_ts") or event["ts"]
+        adapter._dedup.discard(adapter._workspace_event_id(team_id, event_ts))
+        raise
+    return True
