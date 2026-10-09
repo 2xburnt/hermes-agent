@@ -1,8 +1,9 @@
 """Hetz-only owner ingress for ChiefOfBots' private card-thread channel.
 
 Do not turn this into a generic mention exemption: unmapped/unsafe messages are
-consumed, never handed to an LLM that could infer a card from their text. The DM
-path and its owner_handoff exception are deliberately unchanged.
+consumed, never handed to an LLM that could infer a card from their text. Owner-
+authored intake roots have a separate slagent-backed path; bot-root routing and
+the DM owner_handoff exception retain their existing guards.
 """
 from __future__ import annotations
 
@@ -35,7 +36,7 @@ class UnmappedCardThread(Exception):
 def mapped_card(home: Path, thread_ts: str) -> str | None:
     """Only literal card keys count; reports/home-* keys cannot authorize routing."""
     try:
-        data = json.loads((home / "relay" / f"threads.{CHANNEL}.json").read_text())
+        data = json.loads((home / "relay" / f"threads.{CHANNEL}.json").read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
     if not isinstance(data, dict):
@@ -68,6 +69,29 @@ def mapped_card(home: Path, thread_ts: str) -> str | None:
     return None
 
 
+async def verified_owner_conversation(client, channel_id: str) -> bool:
+    """The private two-member channel (or owner's exact IM), never Slack Connect."""
+    user = await client.users_info(user=OWNER)
+    if not user.get("ok") or user.get("user", {}).get("is_bot") is not False:
+        return False
+    info = await client.conversations_info(channel=channel_id)
+    channel = info.get("channel") or {}
+    if (not info.get("ok") or channel.get("id") != channel_id
+            or channel.get("is_mpim")
+            or any(channel.get(k) for k in (
+                "is_archived", "is_shared", "is_ext_shared", "is_org_shared",
+                "is_pending_ext_shared", "pending_shared"))):
+        return False
+    if channel_id == "D0C4S9L5HJL":
+        return channel.get("is_im") is True and channel.get("user") == OWNER
+    if channel_id != CHANNEL or channel.get("is_private") is not True or channel.get("is_im"):
+        return False
+    members = await client.conversations_members(channel=channel_id, limit=20)
+    return bool(members.get("ok")
+                and sorted(members.get("members") or []) == sorted([OWNER, BOT])
+                and not (members.get("response_metadata") or {}).get("next_cursor"))
+
+
 async def verified_card(adapter, event: dict, team_id: str, home: Path) -> str | None:
     """Fail closed; only fully verified mapping failures raise UnmappedCardThread."""
     ts, root_ts = event.get("ts", ""), event.get("thread_ts", "")
@@ -84,21 +108,7 @@ async def verified_card(adapter, event: dict, team_id: str, home: Path) -> str |
     client = adapter._get_client(CHANNEL, team_id=team_id or None)
     try:
         # Unlike the general allow_bots gate, this route never admits bot users.
-        user = await client.users_info(user=OWNER)
-        if not user.get("ok") or user.get("user", {}).get("is_bot") is not False:
-            return None
-        info = await client.conversations_info(channel=CHANNEL)
-        channel = info.get("channel") or {}
-        if (not info.get("ok") or channel.get("id") != CHANNEL
-                or channel.get("is_private") is not True
-                or channel.get("is_im") or channel.get("is_mpim")
-                or any(channel.get(k) for k in (
-                    "is_archived", "is_shared", "is_ext_shared", "is_org_shared",
-                    "is_pending_ext_shared", "pending_shared"))):
-            return None
-        members = await client.conversations_members(channel=CHANNEL, limit=20)
-        if (not members.get("ok") or sorted(members.get("members") or []) != sorted([OWNER, BOT])
-                or (members.get("response_metadata") or {}).get("next_cursor")):
+        if not await verified_owner_conversation(client, CHANNEL):
             return None
         # history can fetch the parent with the bot's groups:history scope; replies
         # for a private channel would require a user token. Never trust root caches.
@@ -155,6 +165,9 @@ def record_wake(home: Path, card: str, comment_id: int) -> None:
 
 async def route_owner_card_reply(adapter, event: dict, team_id: str) -> bool:
     """True = this special channel was consumed (including denied replies)."""
+    from .owner_thread_intake import route_owner_thread
+    if await route_owner_thread(adapter, event, team_id):
+        return True
     if event.get("channel") != CHANNEL or adapter._owner_profile != PROFILE:
         return False
     home = get_profile_dir(PROFILE)
