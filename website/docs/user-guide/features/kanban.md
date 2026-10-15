@@ -425,8 +425,12 @@ times (default `2`), the unblock-loop breaker stops sending it back to `blocked`
 — where a cron would just keep unblocking it — and routes it to `triage` for
 orchestration attention. This is a deterministic DB guard, not an LLM judgment call, and
 a task's body text cannot opt out of it: the recurrence counter deliberately
-survives each unblock (it resets only on a successful `complete`). To keep an
-unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
+survives a bare unblock. A comment by someone other than the assignee after the
+latest block starts the next block at `1` again, including an operator
+`unblock --reason` comment carrying new evidence. The assignee's own comments
+and retries without new input do not reset it. Event order defines "after",
+even when a reply and block share a timestamp. To keep an unblocked task in
+the work pool, resolve *why it keeps re-blocking* (unfinished
 parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
 :::
