@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from tests.gateway.test_slack import adapter  # noqa: F401 — shared fake transport
+from tests.gateway.test_slack import adapter  # shared fake transport fixture
 from plugins.platforms.slack import owner_card_threads as route
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect_closing
@@ -312,8 +312,10 @@ async def test_multi_card_root_routes_only_live_card(setup, monkeypatch, termina
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["unmapped", "two_live", "zero_live", "missing_card"])
-async def test_verified_mapping_rejection_replies_in_thread_once(setup, kind):
+@pytest.mark.parametrize("root_author", [route.BOT, route.OWNER])
+async def test_verified_mapping_rejection_replies_in_thread_once(setup, kind, root_author, caplog):
     a, event, home, card, other, mapping = setup
+    a._app.client.conversations_history.return_value["messages"][0]["user"] = root_author
     mapping.write_text(json.dumps({} if kind == "unmapped" else {card: ROOT, other: ROOT}))
     if kind == "missing_card":
         mapping.write_text(json.dumps({"t_00000000": ROOT}))
@@ -322,6 +324,8 @@ async def test_verified_mapping_rejection_replies_in_thread_once(setup, kind):
         set_status(home, other, "archived")
     await a._handle_slack_message(event)
     await a._handle_slack_message(event)  # Slack delivery dedup
+    await a._handle_slack_message({"type": "message", "subtype": "message_changed",
+        "channel": route.CHANNEL, "ts": "1791479903.000001", "message": event})
     assert comments(home, card) == comments(home, other) == []
     a.handle_message.assert_not_awaited()
     a._app.client.chat_postMessage.assert_awaited_once_with(
@@ -329,6 +333,7 @@ async def test_verified_mapping_rejection_replies_in_thread_once(setup, kind):
         text="couldn't tie this to one card; reply in the DM",
         reply_broadcast=False, unfurl_links=False, unfurl_media=False)
     a._app.client.conversations_history.assert_awaited_once()
+    assert "owner card-thread mapping rejected with fallback" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -362,10 +367,16 @@ async def test_live_status_rechecked_after_slack_calls(setup):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["exception", "not_ok"])
-async def test_fallback_send_failure_allows_retry(setup, failure):
+@pytest.mark.parametrize("root_author", [route.BOT, route.OWNER])
+@pytest.mark.parametrize("edited", [False, True])
+async def test_fallback_send_failure_allows_retry(setup, failure, root_author, edited):
     a, event, _, _, _, mapping = setup
     mapping.write_text("{}")
     client = a._app.client
+    client.conversations_history.return_value["messages"][0]["user"] = root_author
+    if edited:
+        event = {"type": "message", "subtype": "message_changed", "channel": route.CHANNEL,
+                 "ts": "1791479903.000001", "message": event}
     if failure == "exception":
         client.chat_postMessage.side_effect = RuntimeError("offline")
     else:

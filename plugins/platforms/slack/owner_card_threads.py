@@ -33,16 +33,21 @@ class UnmappedCardThread(Exception):
     """Slack identity is verified, but the root has no stable, unique card."""
 
 
-def mapped_card(home: Path, thread_ts: str) -> str | None:
+def mapped_cards(home: Path, thread_ts: str) -> list[str]:
     """Only literal card keys count; reports/home-* keys cannot authorize routing."""
     try:
         data = json.loads((home / "relay" / f"threads.{CHANNEL}.json").read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
-        return None
+        return []
     if not isinstance(data, dict):
-        return None
-    cards = [key for key, value in data.items()
-             if _CARD.fullmatch(key) and value == thread_ts]
+        return []
+    return [key for key, value in data.items()
+            if _CARD.fullmatch(key) and value == thread_ts]
+
+
+def mapped_card(home: Path, thread_ts: str) -> str | None:
+    """Resolve bot-root work routing, not owner-root conversation ownership."""
+    cards = mapped_cards(home, thread_ts)
     if not cards:
         return None
     # Follow-ups retain their terminal parent's root. Only the default board
@@ -116,11 +121,20 @@ async def verified_card(adapter, event: dict, team_id: str, home: Path) -> str |
             channel=CHANNEL, oldest=root_ts, latest=root_ts, inclusive=True, limit=1)
         roots = history.get("messages") or []
         if (not history.get("ok") or len(roots) != 1
-                or roots[0].get("ts") != root_ts or roots[0].get("user") != BOT):
+                or roots[0].get("ts") != root_ts):
+            return None
+        root = roots[0]
+        owner_root = (root.get("user") == OWNER
+                      and not adapter._event_declares_bot_sender(root))
+        if not owner_root and root.get("user") != BOT:
             return None
     except Exception:
         logger.warning("[Slack] owner card-thread verification failed closed", exc_info=True)
         return None
+    # A verified owner root that intake could not route must explain the failure,
+    # never steer a child merely because its notification binding is unique.
+    if owner_root:
+        raise UnmappedCardThread
     # The relay and card status can change while Slack calls are in flight.
     # Do not rebind mid-reply. Only now is it safe to send a fallback in-thread.
     current = await asyncio.to_thread(mapped_card, home, root_ts)
@@ -163,6 +177,29 @@ def record_wake(home: Path, card: str, comment_id: int) -> None:
         kb._append_event(conn, card, "slack_owner_reply_woken", {"comment_id": comment_id})
 
 
+async def send_unmapped_fallback(adapter, event: dict, team_id: str) -> bool:
+    """Explain a verified routing failure; ingress dedup owns delivery retries."""
+    was_claimed = event["ts"] in adapter._processed_message_ts
+    adapter._remember_processed_message_ts(event["ts"])
+    client = adapter._get_client(CHANNEL, team_id=team_id or None)
+    try:
+        response = await client.chat_postMessage(
+            channel=CHANNEL, thread_ts=event["thread_ts"],
+            text="couldn't tie this to one card; reply in the DM",
+            reply_broadcast=False, unfurl_links=False, unfurl_media=False)
+        if not response.get("ok"):
+            raise RuntimeError("owner card-thread fallback was not sent")
+    except BaseException:
+        if not was_claimed:
+            adapter._processed_message_ts.pop(event["ts"], None)
+        event_ts = event.get("_slack_changed_event_ts") or event["ts"]
+        adapter._dedup.discard(adapter._workspace_event_id(team_id, event_ts))
+        raise
+    logger.warning("[Slack] owner card-thread mapping rejected with fallback channel=%s ts=%s",
+                CHANNEL, event["ts"])
+    return True
+
+
 async def route_owner_card_reply(adapter, event: dict, team_id: str) -> bool:
     """True = this special channel was consumed (including denied replies)."""
     from .owner_thread_intake import route_owner_thread
@@ -176,21 +213,7 @@ async def route_owner_card_reply(adapter, event: dict, team_id: str) -> bool:
         comment_id = (await asyncio.to_thread(record_reply, home, card, event)
                       if card is not None else None)
     except UnmappedCardThread:
-        client = adapter._get_client(CHANNEL, team_id=team_id or None)
-        try:
-            response = await client.chat_postMessage(
-                channel=CHANNEL, thread_ts=event["thread_ts"],
-                text="couldn't tie this to one card; reply in the DM",
-                reply_broadcast=False, unfurl_links=False, unfurl_media=False)
-            if not response.get("ok"):
-                raise RuntimeError("owner card-thread fallback was not sent")
-        except BaseException:
-            event_ts = event.get("_slack_changed_event_ts") or event["ts"]
-            adapter._dedup.discard(adapter._workspace_event_id(team_id, event_ts))
-            raise
-        logger.info("[Slack] owner card-thread mapping rejected with fallback channel=%s ts=%s",
-                    CHANNEL, event["ts"])
-        return True
+        return await send_unmapped_fallback(adapter, event, team_id)
     if card is None:
         logger.info("[Slack] owner card-thread rejected channel=%s ts=%s", CHANNEL, event.get("ts"))
         return True

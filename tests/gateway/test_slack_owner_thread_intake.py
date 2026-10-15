@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from tests.gateway.test_slack import adapter  # noqa: F401
-from tests.gateway.test_slack_owner_card_threads import setup as setup, comments, TS, ROOT
+from tests.gateway.test_slack import adapter  # shared fake transport fixture
+from tests.gateway.test_slack_owner_card_threads import setup, comments, TS, ROOT
 from plugins.platforms.slack import owner_card_threads as route
 from plugins.platforms.slack import owner_thread_intake as intake
 from hermes_cli import kanban_db as kb
@@ -143,20 +143,55 @@ async def test_intake_unavailable_leaves_turn_untracked(tracked):
 
 
 @pytest.mark.asyncio
-async def test_owner_root_continuation_uses_bound_card_not_a_new_intake(tracked):
+@pytest.mark.parametrize("children", [False, True])
+async def test_owner_root_continuation_uses_bound_card_not_a_new_intake(tracked, children):
     import json
     a, event, home, _, _, mapping, caller = tracked
     with connect_closing(home.parent.parent / "kanban.db") as conn:
         card = kb.create_task(conn, title="owner chat", assignee=route.PROFILE,
             created_by="slagent", initial_status="blocked",
             idempotency_key=f"slack-thread:{route.CHANNEL}:{TS}")
-    mapping.write_text(json.dumps({card: TS}))
+    bindings = {card: TS}
+    if children:
+        bindings.update({tracked[3]: TS, tracked[4]: TS})
+    mapping.write_text(json.dumps(bindings))
     await a._handle_slack_message({**event, "ts": "1791479901.000001", "thread_ts": TS})
     caller.assert_not_awaited()
     turn = a.handle_message.await_args.args[0]
     assert turn.text.startswith(f"[Tracked as card {card}]\n")
     assert turn.source.thread_id == TS
     assert comments(home, card) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["creator", "assignee", "key", "binding", "changed_binding"])
+async def test_continuation_requires_intake_identity_and_stable_binding(tracked, invalid):
+    import json
+    a, event, home, _, other, mapping, caller = tracked
+    with connect_closing(home.parent.parent / "kanban.db") as conn:
+        card = kb.create_task(conn, title="owner chat", assignee=route.PROFILE,
+            created_by="slagent", initial_status="blocked",
+            idempotency_key=f"slack-thread:{route.CHANNEL}:{TS}")
+        updates = {"creator": ("created_by", "user"), "assignee": ("assignee", "burntbot"),
+                   "key": ("idempotency_key", f"slack-thread:{route.CHANNEL}:{ROOT}")}
+        if invalid in updates:
+            field, value = updates[invalid]
+            with kb.write_txn(conn):
+                conn.execute(f"UPDATE tasks SET {field}=? WHERE id=?", (value, card))
+    mapping.write_text(json.dumps({other: TS} if invalid == "binding" else {card: TS, other: TS}))
+    if invalid == "changed_binding":
+        result = a._app.client.conversations_history.return_value
+        async def changed(**kwargs):
+            mapping.write_text(json.dumps({other: TS}))
+            return result
+        a._app.client.conversations_history.side_effect = changed
+    reply = {**event, "ts": "1791479901.000001", "thread_ts": TS}
+    await a._handle_slack_message(reply)
+    await a._handle_slack_message(reply)
+    caller.assert_not_awaited()
+    a.handle_message.assert_not_awaited()
+    a._app.client.chat_postMessage.assert_awaited_once()
+    assert comments(home, card) == comments(home, other) == []
 
 
 @pytest.mark.asyncio

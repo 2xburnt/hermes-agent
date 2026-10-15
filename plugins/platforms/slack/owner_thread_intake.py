@@ -69,17 +69,15 @@ async def intake_card(home: Path, event: dict, team_id: str) -> str | None:
 
 def continuation_card(home: Path, root_ts: str) -> str | None:
     """Only slagent intake roots gain conversational continuation, never old cards."""
-    card = cards.mapped_card(home, root_ts)
-    if card is None:
-        return None
     uri = (home.parent.parent / "kanban.db").resolve().as_uri() + "?mode=ro"
     try:
         with closing(sqlite3.connect(uri, uri=True, timeout=1)) as conn:
             row = conn.execute(
-                "SELECT id FROM tasks WHERE id=? AND created_by='slagent' "
+                "SELECT id FROM tasks WHERE created_by='slagent' "
                 "AND assignee=? AND idempotency_key=?",
-                (card, cards.PROFILE, f"slack-thread:{cards.CHANNEL}:{root_ts}")).fetchone()
-        return row[0] if row else None
+                (cards.PROFILE, f"slack-thread:{cards.CHANNEL}:{root_ts}")).fetchone()
+        # Children share notification roots; the intake owns the conversation.
+        return row[0] if row and row[0] in cards.mapped_cards(home, root_ts) else None
     except sqlite3.Error:
         logger.warning("[Slack] owner intake continuation lookup failed closed")
         return None
@@ -160,7 +158,7 @@ async def route_owner_thread(adapter, event: dict, team_id: str) -> bool:
     if not await verified_owner_root(adapter, event, team_id, root_ts):
         return True
     if root_ts != ts and card != await asyncio.to_thread(continuation_card, home, root_ts):
-        return True  # binding changed while Slack checks were in flight
+        return await cards.send_unmapped_fallback(adapter, event, team_id)
     try:
         from .adapter import _rewrite_known_bang_command
         canonical = (event.get("text") or "").replace(f"<@{cards.BOT}>", "").strip()
