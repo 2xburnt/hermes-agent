@@ -1,6 +1,9 @@
 """Hetz private card-thread admission through the real Slack ingress handler."""
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
+
+from gateway.session_envelope import _validate_native
 
 import pytest
 
@@ -88,8 +91,18 @@ async def test_mapped_owner_reply_records_only_target_and_wakes_without_mention(
     assert comments(home, other) == []
     a.handle_message.assert_awaited_once()
     wake = a.handle_message.await_args.args[0]
-    assert wake.metadata["owner_card_thread"] == card
-    assert wake.metadata["owner_comment_id"] == rows[0].id
+    runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=False),
+        _adapter_flag=lambda *args: False,
+        _adapter_profile_for_source=lambda source: route.PROFILE,
+        _is_user_authorized_for_source=lambda source, **kwargs: source.user_id == route.OWNER,
+        _adapter_for_source=lambda source: a,
+    )
+    admitted_source = _validate_native(runner, wake)
+    assert admitted_source["chat_id"] == route.CHANNEL
+    assert admitted_source["thread_id"] == ROOT
+    assert wake.metadata == {}
+    assert f"{card}; owner comment {rows[0].id} already recorded" in wake.text
     assert wake.source.chat_id == route.CHANNEL
     assert wake.source.thread_id == ROOT
     assert wake.source.user_id == route.OWNER
@@ -306,7 +319,9 @@ async def test_multi_card_root_routes_only_live_card(setup, monkeypatch, termina
     assert len(comments(home, card)) == 1
     assert comments(home, other) == []
     a.handle_message.assert_awaited_once()
-    assert a.handle_message.await_args.args[0].metadata["owner_card_thread"] == card
+    wake = a.handle_message.await_args.args[0]
+    assert wake.metadata == {}
+    assert wake.text.startswith(f"[Verified card-thread reply: {card};")
     a._app.client.chat_postMessage.assert_not_awaited()
 
 

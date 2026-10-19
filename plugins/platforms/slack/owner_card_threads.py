@@ -235,8 +235,7 @@ async def route_owner_card_reply(adapter, event: dict, team_id: str) -> bool:
               "that card's context; do not automatically unblock. Reply here with a brief "
               "routing acknowledgment. This is NOT approval to send: sends still require a Send tap."),
         source=source, message_id=event["ts"], raw_message=event,
-        allow_gateway_control=False, reply_expected=True,
-        metadata={"owner_card_thread": card, "owner_comment_id": comment_id})
+        allow_gateway_control=False, reply_expected=True)
     try:
         await adapter.handle_message(wake)
         if not wake._gateway_accepted:
