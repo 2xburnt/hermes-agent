@@ -135,7 +135,6 @@ async def build_turn(adapter, event: dict, team_id: str, root_ts: str, card: str
         channel_context=None, reply_expected=True)
     if card and not is_command:
         turn.text = f"[Tracked as card {card}]\n{turn.text}"
-        turn.metadata["tracked_card_id"] = card
     return turn
 
 

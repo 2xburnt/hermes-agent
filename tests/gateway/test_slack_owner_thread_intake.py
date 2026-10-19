@@ -1,6 +1,9 @@
 """Owner-authored Chief roots use a tracked, root-scoped gateway turn."""
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
+
+from gateway.session_envelope import _validate_native
 
 import pytest
 
@@ -44,7 +47,17 @@ async def test_owner_root_reaches_chief_and_reply_uses_same_thread(tracked, chan
     assert turn.source.user_id == route.OWNER
     assert turn.reply_expected is True
     assert turn.text == f"[Tracked as card {card}]\n{event['text']}"
-    assert turn.metadata["tracked_card_id"] == card
+    runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=False),
+        _adapter_flag=lambda *args: False,
+        _adapter_profile_for_source=lambda source: route.PROFILE,
+        _is_user_authorized_for_source=lambda source, **kwargs: source.user_id == route.OWNER,
+        _adapter_for_source=lambda source: a,
+    )
+    admitted_source = _validate_native(runner, turn)
+    assert admitted_source["chat_id"] == channel
+    assert admitted_source["thread_id"] == TS
+    assert turn.metadata == {}
     assert comments(home, card) == comments(home, other) == []
     result = await a.send(turn.source.chat_id, "ack", metadata={"thread_id": turn.source.thread_id})
     assert result.success
