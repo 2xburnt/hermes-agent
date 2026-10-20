@@ -83,6 +83,41 @@ def test_later_explicit_unblock_renews_permission(board):
     assert kbd.check_respawn_guard(board, tid) is None
 
 
+def test_crashed_pr_owner_recovery_dispatches_same_profile(board, monkeypatch):
+    """Recovery must renew the consumed retry, not duplicate or reassign the PR."""
+    import hermes_cli.profiles as profiles
+    import hermes_cli.config as config
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    monkeypatch.setattr(config, "load_config", lambda *a, **k: {})
+    tid = kb.create_task(board, title="continue PR", assignee="dev", initial_status="blocked")
+    kb.unblock_task(board, tid)
+    kb.claim_task(board, tid)
+    kb.add_comment(board, tid, author="dev", body=PR)
+    kbd._set_worker_pid(board, tid, 98765)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+    assert kbd.detect_crashed_workers(board) == [tid]
+    task = kb.get_task(board, tid)
+    assert task is not None and task.status == "ready"
+    assert kbd.check_respawn_guard(board, tid) == "active_pr"
+    # Merely unblocking an already-ready card is a no-op.
+    assert not kb.unblock_task(board, tid)
+
+    # The operator has verified the old run is dead and this card still owns
+    # the PR. A real block/unblock records fresh, one-claim retry permission.
+    assert kb.block_task(board, tid, reason="verified existing PR continuation")
+    assert kb.unblock_task(board, tid)
+    kb.add_comment(board, tid, author="operator", body=PR)
+    assert kbd.check_respawn_guard(board, tid) is None
+
+    result = kbd.dispatch_once(board, dry_run=True)
+    assert tid in [item[0] for item in result.spawned]
+    assert tid not in dict(result.respawn_guarded)
+    task = kb.get_task(board, tid)
+    assert task is not None and task.assignee == "dev"
+
+
 def test_requeue_does_not_override_auth_blocker(board):
     tid = kb.create_task(board, title="retry", assignee="dev", initial_status="blocked")
     kb.unblock_task(board, tid)
