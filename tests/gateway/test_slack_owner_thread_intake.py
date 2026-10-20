@@ -202,8 +202,12 @@ async def test_continuation_requires_intake_identity_and_stable_binding(tracked,
     await a._handle_slack_message(reply)
     await a._handle_slack_message(reply)
     caller.assert_not_awaited()
-    a.handle_message.assert_not_awaited()
-    a._app.client.chat_postMessage.assert_awaited_once()
+    a.handle_message.assert_awaited_once()
+    wake = a.handle_message.await_args.args[0]
+    assert wake.source.thread_id == TS
+    assert event["text"] in wake.text
+    assert other in wake.text
+    a._app.client.chat_postMessage.assert_not_awaited()
     assert comments(home, card) == comments(home, other) == []
 
 

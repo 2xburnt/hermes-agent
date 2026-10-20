@@ -1,9 +1,9 @@
 """Hetz-only owner ingress for ChiefOfBots' private card-thread channel.
 
-Do not turn this into a generic mention exemption: unmapped/unsafe messages are
-consumed, never handed to an LLM that could infer a card from their text. Owner-
-authored intake roots have a separate slagent-backed path; bot-root routing and
-the DM owner_handoff exception retain their existing guards.
+Do not turn this into a generic mention exemption: unsafe messages are consumed.
+Verified owner replies route to one card or wake Chief in the same thread for
+recovery. Owner-authored intake roots have a separate slagent-backed path; the
+DM owner_handoff exception retains its existing guards.
 """
 from __future__ import annotations
 
@@ -27,14 +27,15 @@ BOT = "U0C3ZSP1K09"
 PROFILE = "chiefofbots"
 _TS = re.compile(r"[0-9]{9,11}\.[0-9]{6}")
 _CARD = re.compile(r"t_[0-9a-f]{8}")
+_CHIEF_ITEM = re.compile(r"cos:[0-9a-f]+")
 
 
 class UnmappedCardThread(Exception):
-    """Slack identity is verified, but the root has no stable, unique card."""
+    """Slack identity is verified, but the root has no stable card binding."""
 
 
-def mapped_cards(home: Path, thread_ts: str) -> list[str]:
-    """Only literal card keys count; reports/home-* keys cannot authorize routing."""
+def mapped_thread_items(home: Path, thread_ts: str) -> list[str]:
+    """Literal card/Chief item IDs only; never pass arbitrary relay text to a turn."""
     try:
         data = json.loads((home / "relay" / f"threads.{CHANNEL}.json").read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
@@ -42,7 +43,12 @@ def mapped_cards(home: Path, thread_ts: str) -> list[str]:
     if not isinstance(data, dict):
         return []
     return [key for key, value in data.items()
-            if _CARD.fullmatch(key) and value == thread_ts]
+            if (_CARD.fullmatch(key) or _CHIEF_ITEM.fullmatch(key)) and value == thread_ts]
+
+
+def mapped_cards(home: Path, thread_ts: str) -> list[str]:
+    """Chief's Linear items are recovery context, never board-card authority."""
+    return [key for key in mapped_thread_items(home, thread_ts) if _CARD.fullmatch(key)]
 
 
 def mapped_card(home: Path, thread_ts: str) -> str | None:
@@ -56,22 +62,23 @@ def mapped_card(home: Path, thread_ts: str) -> str | None:
     try:
         with closing(sqlite3.connect(db_uri, uri=True, timeout=1)) as conn:
             rows = list(conn.execute(
-                f"SELECT id, status FROM tasks WHERE id IN ({','.join('?' for _ in cards)})",
+                f"SELECT id, status, created_at FROM tasks WHERE id IN ({','.join('?' for _ in cards)})",
                 cards))
     except (OSError, sqlite3.Error):
         logger.warning("[Slack] owner card-thread board lookup failed closed", exc_info=True)
         return None
-    # Keep the existing ability to follow up on a single terminal card, but a
-    # stale key for a deleted/nonexistent card must receive the same fallback.
-    if len(cards) == 1:
-        return rows[0][0] if rows else None
-    live = [card for card, status in rows if status not in {"done", "archived"}]
-    if len(live) == 1:
-        return live[0]
-    # An ambiguous root must never fan out an owner instruction to several cards.
-    logger.warning("[Slack] ambiguous owner card-thread root=%s cards=%s live=%s",
-                   thread_ts, cards, live)
-    return None
+    if not rows:
+        return None
+    live = [row for row in rows if row[1] not in {"done", "archived"}]
+    priority = {"blocked": 0, "running": 1, "ready": 2, "todo": 2}
+    # Never fan out. Creation time (not update time or relay order) breaks ties;
+    # the ID is a stable final tie-break for cards created in the same second.
+    chosen = min(live or rows, key=lambda row: (
+        priority.get(row[1], 3) if live else 0, -row[2], row[0]))[0]
+    if len(cards) > 1:
+        logger.info("[Slack] owner card-thread selected root=%s card=%s candidates=%s rows=%s",
+                    thread_ts, chosen, sorted(cards), sorted(rows))
+    return chosen
 
 
 async def verified_owner_conversation(client, channel_id: str) -> bool:
@@ -143,7 +150,7 @@ async def verified_card(adapter, event: dict, team_id: str, home: Path) -> str |
     return card
 
 
-def record_reply(home: Path, card: str, event: dict) -> int | None:
+def record_reply(home: Path, card: str, event: dict) -> tuple[str, int] | None:
     """Write once on the shared default board; a comment also steers a live worker."""
     source = f"slack:{CHANNEL}:{event['thread_ts']}:{event['ts']}"
     text = str(event.get("text") or "")
@@ -163,13 +170,14 @@ def record_reply(home: Path, card: str, event: dict) -> int | None:
                 "SELECT id, task_id FROM task_comments WHERE author=? AND substr(body,1,?)=?",
                 (f"slack:{OWNER}", len(prefix), prefix)).fetchone()
             if prior is not None:
-                if prior["task_id"] != card:
-                    return None
+                # A status change can rank a different card on a retry. Finish
+                # the original wake, never drop it or comment on the new winner.
+                card = prior["task_id"]
                 delivered = conn.execute(
                     "SELECT 1 FROM task_events WHERE task_id=? AND kind='slack_owner_reply_woken' "
                     "AND json_extract(payload, '$.comment_id')=?", (card, prior["id"])).fetchone()
-                return None if delivered else prior["id"]
-            return kb.add_comment(conn, card, f"slack:{OWNER}", body)
+                return None if delivered else (card, prior["id"])
+            return card, kb.add_comment(conn, card, f"slack:{OWNER}", body)
 
 
 def record_wake(home: Path, card: str, comment_id: int) -> None:
@@ -177,26 +185,39 @@ def record_wake(home: Path, card: str, comment_id: int) -> None:
         kb._append_event(conn, card, "slack_owner_reply_woken", {"comment_id": comment_id})
 
 
-async def send_unmapped_fallback(adapter, event: dict, team_id: str) -> bool:
-    """Explain a verified routing failure; ingress dedup owns delivery retries."""
-    was_claimed = event["ts"] in adapter._processed_message_ts
+async def wake_unmapped_thread(adapter, event: dict, team_id: str) -> bool:
+    """Keep a verified owner's reply in its Chief session, even without a card."""
+    home = get_profile_dir(PROFILE)
     adapter._remember_processed_message_ts(event["ts"])
-    client = adapter._get_client(CHANNEL, team_id=team_id or None)
+    items = sorted(await asyncio.to_thread(mapped_thread_items, home, event["thread_ts"]))
+    candidates = [key for key in items if _CARD.fullmatch(key)]
+    chief_items = [key for key in items if _CHIEF_ITEM.fullmatch(key)]
+    source = adapter.build_source(
+        chat_id=CHANNEL, chat_name="chief-of-bots", chat_type="group",
+        user_id=OWNER, user_name="twiceburnt", thread_id=event["thread_ts"],
+        scope_id=team_id or None, is_bot=False)
+    wake = MessageEvent(
+        text=("[Verified owner thread reply; automatic card routing unavailable.]\n"
+              f"Candidate cards (may be stale): {', '.join(candidates) or 'none'}.\n"
+              f"ChiefOfBots-owned Linear relay items: {', '.join(chief_items) or 'none'}.\n"
+              "Handle this reply here as ChiefOfBots. No card comment has been recorded by "
+              "this fallback. Check the thread and candidates before choosing at most one card; "
+              "do not fan out or duplicate an existing owner comment. If the binding cannot "
+              "be recovered, resolve it with the owner here. This is NOT send approval; "
+              "sends still require a Send tap.\n\nOwner reply:\n" + str(event.get("text") or "")),
+        source=source, message_id=event["ts"], raw_message=event,
+        allow_gateway_control=False, reply_expected=True)
     try:
-        response = await client.chat_postMessage(
-            channel=CHANNEL, thread_ts=event["thread_ts"],
-            text="couldn't tie this to one card; reply in the DM",
-            reply_broadcast=False, unfurl_links=False, unfurl_media=False)
-        if not response.get("ok"):
-            raise RuntimeError("owner card-thread fallback was not sent")
+        await adapter.handle_message(wake)
+        if not wake._gateway_accepted:
+            raise RuntimeError("owner card-thread fallback was not admitted")
     except BaseException:
-        if not was_claimed:
-            adapter._processed_message_ts.pop(event["ts"], None)
+        adapter._processed_message_ts.pop(event["ts"], None)
         event_ts = event.get("_slack_changed_event_ts") or event["ts"]
         adapter._dedup.discard(adapter._workspace_event_id(team_id, event_ts))
         raise
-    logger.warning("[Slack] owner card-thread mapping rejected with fallback channel=%s ts=%s",
-                CHANNEL, event["ts"])
+    logger.info("[Slack] owner card-thread fallback admitted channel=%s ts=%s candidates=%s items=%s",
+                CHANNEL, event["ts"], candidates, chief_items)
     return True
 
 
@@ -210,15 +231,16 @@ async def route_owner_card_reply(adapter, event: dict, team_id: str) -> bool:
     home = get_profile_dir(PROFILE)
     try:
         card = await verified_card(adapter, event, team_id, home)
-        comment_id = (await asyncio.to_thread(record_reply, home, card, event)
-                      if card is not None else None)
-    except UnmappedCardThread:
-        return await send_unmapped_fallback(adapter, event, team_id)
+        recorded = (await asyncio.to_thread(record_reply, home, card, event)
+                    if card is not None else None)
+    except (UnmappedCardThread, sqlite3.Error):
+        return await wake_unmapped_thread(adapter, event, team_id)
     if card is None:
         logger.info("[Slack] owner card-thread rejected channel=%s ts=%s", CHANNEL, event.get("ts"))
         return True
-    if comment_id is None:
+    if recorded is None:
         return True
+    card, comment_id = recorded
     logger.info("[Slack] owner card-thread routed channel=%s ts=%s card=%s comment=%s",
                 CHANNEL, event["ts"], card, comment_id)
     source = adapter.build_source(

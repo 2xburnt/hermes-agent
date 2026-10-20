@@ -157,7 +157,7 @@ async def route_owner_thread(adapter, event: dict, team_id: str) -> bool:
     if not await verified_owner_root(adapter, event, team_id, root_ts):
         return True
     if root_ts != ts and card != await asyncio.to_thread(continuation_card, home, root_ts):
-        return await cards.send_unmapped_fallback(adapter, event, team_id)
+        return await cards.wake_unmapped_thread(adapter, event, team_id)
     try:
         from .adapter import _rewrite_known_bang_command
         canonical = (event.get("text") or "").replace(f"<@{cards.BOT}>", "").strip()

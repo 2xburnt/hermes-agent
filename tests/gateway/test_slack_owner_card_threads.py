@@ -69,13 +69,15 @@ async def test_verifier_rejects_wrong_channel_independently(setup):
 
 
 @pytest.mark.asyncio
-async def test_unmapped_discussion_thread_does_not_route(setup):
+async def test_unmapped_discussion_thread_wakes_chief_without_a_card_comment(setup):
     a, event, home, card, _, mapping = setup
     mapping.write_text(json.dumps({card: ROOT, "disc:slack:C_TEST": TS}))
     a._app.client.conversations_history.return_value["messages"][0]["ts"] = TS
     await a._handle_slack_message({**event, "ts": "1791479901.000001", "thread_ts": TS})
     assert comments(home, card) == []
-    a.handle_message.assert_not_awaited()
+    a.handle_message.assert_awaited_once()
+    assert "Candidate cards (may be stale): none" in a.handle_message.await_args.args[0].text
+    a._app.client.chat_postMessage.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -174,7 +176,7 @@ async def test_members_guards(setup, response):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("response", [
     {"ok": False}, {"ok": True, "messages": []},
-    {"ok": True, "messages": [{"ts": ROOT, "user": route.OWNER}]},
+
     {"ok": True, "messages": [{"ts": TS, "user": route.BOT}]},
     {"ok": True, "messages": [{"ts": ROOT, "user": "U_OTHER_BOT", "bot_id": "B_BOT"}]},
 ])
@@ -209,7 +211,8 @@ async def test_unmapped_malformed_ambiguous_or_nonexistent_card(setup, raw):
         mapping.write_text(raw)
     await a._handle_slack_message(event)
     assert comments(home, card) == []
-    a.handle_message.assert_not_awaited()
+    a.handle_message.assert_awaited_once()
+    a._app.client.chat_postMessage.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -224,7 +227,8 @@ async def test_rechecks_members_and_map_without_positive_cache(setup):
     mapping.write_text("{}")
     await a._handle_slack_message({**event, "ts": "1791479900.000003"})
     assert len(comments(home, card)) == 1
-    assert a.handle_message.await_count == 1
+    assert a.handle_message.await_count == 2
+    assert "automatic card routing unavailable" in a.handle_message.await_args.args[0].text
 
 
 @pytest.mark.asyncio
@@ -252,6 +256,27 @@ async def test_failed_wake_retries_without_duplicate_comment(setup, failure):
     await a._handle_slack_message(event)
     assert len(comments(home, card)) == 1
     assert a.handle_message.await_count == 2
+    await route.route_owner_card_reply(a, event, "")
+    assert a.handle_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_pending_wake_keeps_original_card_when_shared_root_ranking_changes(setup):
+    a, event, home, card, other, mapping = setup
+    mapping.write_text(json.dumps({card: ROOT, other: ROOT}))
+    set_status(home, other, "scheduled")
+    accepted = a.handle_message.side_effect
+    a.handle_message.side_effect = RuntimeError("offline")
+    with pytest.raises(RuntimeError):
+        await a._handle_slack_message(event)
+    set_status(home, card, "scheduled")
+    set_status(home, other, "blocked")
+    a.handle_message.side_effect = accepted
+    await a._handle_slack_message(event)
+    assert a.handle_message.await_count == 2
+    assert a.handle_message.await_args.args[0].text.startswith(f"[Verified card-thread reply: {card};")
+    assert len(comments(home, card)) == 1
+    assert comments(home, other) == []
     await route.route_owner_card_reply(a, event, "")
     assert a.handle_message.await_count == 2
 
@@ -286,14 +311,101 @@ async def test_map_rechecked_after_slack_calls(setup):
     a._app.client.conversations_history.side_effect = changed
     await a._handle_slack_message(event)
     assert comments(home, card) == []
-    a.handle_message.assert_not_awaited()
+    a.handle_message.assert_awaited_once()
+    a._app.client.chat_postMessage.assert_not_awaited()
 
 
 def test_map_ambiguity_is_logged(setup, caplog):
+    caplog.set_level("INFO", logger=route.__name__)
     _, _, home, card, other, mapping = setup
     mapping.write_text(json.dumps({card: ROOT, other: ROOT, "disc:test": ROOT}))
-    assert route.mapped_card(home, ROOT) is None
-    assert "ambiguous owner card-thread" in caplog.text
+    assert route.mapped_card(home, ROOT) in {card, other}
+    assert "owner card-thread selected" in caplog.text
+    assert card in caplog.text and other in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_shared_root_prefers_blocked_over_newer_scheduled(setup):
+    a, event, home, card, other, mapping = setup
+    mapping.write_text(json.dumps({other: ROOT, card: ROOT}))
+    set_status(home, other, "scheduled")
+    with connect_closing(home.parent.parent / "kanban.db") as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (100, card))
+        conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (200, other))
+    await a._handle_slack_message(event)
+    assert len(comments(home, card)) == 1
+    assert comments(home, other) == []
+    a.handle_message.assert_awaited_once()
+    assert a.handle_message.await_args.args[0].text.startswith(f"[Verified card-thread reply: {card};")
+    a._app.client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("statuses,newer", [
+    (("blocked", "blocked"), 0), (("blocked", "blocked"), 1),
+    (("done", "archived"), 0), (("done", "archived"), 1),
+    (("ready", "todo"), 0), (("ready", "todo"), 1),
+    (("scheduled", "review"), 0), (("scheduled", "review"), 1),
+])
+async def test_shared_root_equal_priority_uses_creation_not_map_order(setup, statuses, newer):
+    a, event, home, card, other, mapping = setup
+    cards = [card, other]
+    for index, candidate in enumerate(cards):
+        set_status(home, candidate, statuses[index])
+        with connect_closing(home.parent.parent / "kanban.db") as conn, kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET created_at=? WHERE id=?",
+                         (200 if index == newer else 100, candidate))
+    expected, loser = cards[newer], cards[1 - newer]
+    mapping.write_text(json.dumps({loser: ROOT, expected: ROOT}))
+    await a._handle_slack_message(event)
+    assert len(comments(home, expected)) == 1
+    assert comments(home, loser) == []
+    a.handle_message.assert_awaited_once()
+    assert a.handle_message.await_args.args[0].text.startswith(f"[Verified card-thread reply: {expected};")
+    a._app.client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.parametrize("preferred,lower", [
+    ("blocked", "running"), ("blocked", "ready"), ("blocked", "todo"),
+    ("running", "ready"), ("running", "todo"),
+    ("ready", "scheduled"), ("todo", "scheduled"),
+    ("ready", "review"), ("todo", "triage"),
+    ("scheduled", "done"), ("review", "archived"), ("triage", "done"),
+])
+def test_shared_root_status_priority_beats_newer_creation(setup, preferred, lower):
+    _, _, home, card, other, mapping = setup
+    set_status(home, card, preferred)
+    set_status(home, other, lower)
+    with connect_closing(home.parent.parent / "kanban.db") as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (100, card))
+        conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (200, other))
+    for ordering in ({card: ROOT, other: ROOT}, {other: ROOT, card: ROOT}):
+        mapping.write_text(json.dumps(ordering))
+        assert route.mapped_card(home, ROOT) == card
+
+
+@pytest.mark.asyncio
+async def test_linear_chief_item_wakes_owning_session_with_item_context(setup):
+    a, event, home, card, other, mapping = setup
+    mapping.write_text(json.dumps({"cos:5692440f56cb": ROOT, "disc:ignore": ROOT}))
+    await a._handle_slack_message(event)
+    a.handle_message.assert_awaited_once()
+    wake = a.handle_message.await_args.args[0]
+    assert wake.source.thread_id == ROOT
+    assert "cos:5692440f56cb" in wake.text
+    assert event["text"] in wake.text
+    assert "disc:ignore" not in wake.text
+    assert comments(home, card) == comments(home, other) == []
+    a._app.client.chat_postMessage.assert_not_awaited()
+
+
+def test_shared_root_same_second_tie_is_stable(setup):
+    _, _, home, card, other, mapping = setup
+    with connect_closing(home.parent.parent / "kanban.db") as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET created_at=100")
+    for ordering in ({card: ROOT, other: ROOT}, {other: ROOT, card: ROOT}):
+        mapping.write_text(json.dumps(ordering))
+        assert route.mapped_card(home, ROOT) == min(card, other)
 
 
 def set_status(home, card, status):
@@ -326,29 +438,43 @@ async def test_multi_card_root_routes_only_live_card(setup, monkeypatch, termina
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["unmapped", "two_live", "zero_live", "missing_card"])
+@pytest.mark.parametrize("kind", ["unmapped", "missing_card"])
 @pytest.mark.parametrize("root_author", [route.BOT, route.OWNER])
-async def test_verified_mapping_rejection_replies_in_thread_once(setup, kind, root_author, caplog):
+async def test_verified_mapping_failure_wakes_chief_in_thread_once(setup, kind, root_author, caplog):
+    caplog.set_level("INFO", logger=route.__name__)
     a, event, home, card, other, mapping = setup
     a._app.client.conversations_history.return_value["messages"][0]["user"] = root_author
     mapping.write_text(json.dumps({} if kind == "unmapped" else {card: ROOT, other: ROOT}))
     if kind == "missing_card":
         mapping.write_text(json.dumps({"t_00000000": ROOT}))
-    if kind == "zero_live":
-        set_status(home, card, "done")
-        set_status(home, other, "archived")
+
     await a._handle_slack_message(event)
     await a._handle_slack_message(event)  # Slack delivery dedup
     await a._handle_slack_message({"type": "message", "subtype": "message_changed",
         "channel": route.CHANNEL, "ts": "1791479903.000001", "message": event})
     assert comments(home, card) == comments(home, other) == []
-    a.handle_message.assert_not_awaited()
-    a._app.client.chat_postMessage.assert_awaited_once_with(
-        channel=route.CHANNEL, thread_ts=ROOT,
-        text="couldn't tie this to one card; reply in the DM",
-        reply_broadcast=False, unfurl_links=False, unfurl_media=False)
+    a.handle_message.assert_awaited_once()
+    wake = a.handle_message.await_args.args[0]
+    assert wake.source.chat_id == route.CHANNEL
+    assert wake.source.thread_id == ROOT
+    assert wake.source.user_id == route.OWNER
+    assert event["text"] in wake.text
+    assert "Candidate cards" in wake.text
+    if kind == "missing_card":
+        assert "t_00000000" in wake.text
+    assert wake.allow_gateway_control is False
+    assert wake.metadata == {}
+    runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=False),
+        _adapter_flag=lambda *args: False,
+        _adapter_profile_for_source=lambda source: route.PROFILE,
+        _is_user_authorized_for_source=lambda source, **kwargs: source.user_id == route.OWNER,
+        _adapter_for_source=lambda source: a,
+    )
+    assert _validate_native(runner, wake)["thread_id"] == ROOT
+    a._app.client.chat_postMessage.assert_not_awaited()
     a._app.client.conversations_history.assert_awaited_once()
-    assert "owner card-thread mapping rejected with fallback" in caplog.text
+    assert "owner card-thread fallback admitted" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -376,15 +502,15 @@ async def test_live_status_rechecked_after_slack_calls(setup):
     a._app.client.conversations_history.side_effect = changed
     await a._handle_slack_message(event)
     assert comments(home, card) == comments(home, other) == []
-    a.handle_message.assert_not_awaited()
-    a._app.client.chat_postMessage.assert_awaited_once()
+    a.handle_message.assert_awaited_once()
+    a._app.client.chat_postMessage.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["exception", "not_ok"])
+@pytest.mark.parametrize("failure", ["exception", "refused"])
 @pytest.mark.parametrize("root_author", [route.BOT, route.OWNER])
 @pytest.mark.parametrize("edited", [False, True])
-async def test_fallback_send_failure_allows_retry(setup, failure, root_author, edited):
+async def test_fallback_wake_failure_allows_retry(setup, failure, root_author, edited):
     a, event, _, _, _, mapping = setup
     mapping.write_text("{}")
     client = a._app.client
@@ -392,17 +518,14 @@ async def test_fallback_send_failure_allows_retry(setup, failure, root_author, e
     if edited:
         event = {"type": "message", "subtype": "message_changed", "channel": route.CHANNEL,
                  "ts": "1791479903.000001", "message": event}
-    if failure == "exception":
-        client.chat_postMessage.side_effect = RuntimeError("offline")
-    else:
-        client.chat_postMessage.return_value = {"ok": False}
+    accepted = a.handle_message.side_effect
+    a.handle_message.side_effect = RuntimeError("offline") if failure == "exception" else None
     with pytest.raises(RuntimeError):
         await a._handle_slack_message(event)
-    client.chat_postMessage.side_effect = None
-    client.chat_postMessage.return_value = {"ok": True}
+    a.handle_message.side_effect = accepted
     await a._handle_slack_message(event)
-    assert client.chat_postMessage.await_count == 2
-    a.handle_message.assert_not_awaited()
+    assert a.handle_message.await_count == 2
+    client.chat_postMessage.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -438,10 +561,26 @@ def test_mapping_lookup_fails_closed_without_creating_board(setup, board_state):
 
 
 @pytest.mark.asyncio
+async def test_verified_comment_store_failure_wakes_thread_instead(setup, monkeypatch):
+    import sqlite3
+    a, event, home, card, _, _ = setup
+    def unavailable(*args):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(route, "record_reply", unavailable)
+    await a._handle_slack_message(event)
+    assert comments(home, card) == []
+    a.handle_message.assert_awaited_once()
+    assert card in a.handle_message.await_args.args[0].text
+    assert event["text"] in a.handle_message.await_args.args[0].text
+    a._app.client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_card_removed_before_record_gets_fallback(setup, monkeypatch):
     a, event, home, card, _, _ = setup
     monkeypatch.setattr(kb, "get_task", lambda conn, task_id: None)
     await a._handle_slack_message(event)
     assert comments(home, card) == []
-    a.handle_message.assert_not_awaited()
-    a._app.client.chat_postMessage.assert_awaited_once()
+    a.handle_message.assert_awaited_once()
+    assert card in a.handle_message.await_args.args[0].text
+    a._app.client.chat_postMessage.assert_not_awaited()
