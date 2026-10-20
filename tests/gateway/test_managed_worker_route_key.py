@@ -198,14 +198,17 @@ def test_primary_auth_failure_never_borrows_a_fallback_providers_key(tmp_path, m
     """A fallback entry's credential belongs to another provider; the worker's primary route never
     carries it (the agent's own fallback chain switches provider, model and key together)."""
     calls = []
+    fallback_pool = object()
 
     def resolve(config, **kwargs):
         calls.append(kwargs)
-        return {'provider': 'openrouter', 'api_key': 'fake-other-provider'}, {'provider': 'openrouter', 'model': 'x'}
+        return {'provider': 'openrouter', 'api_key': 'fake-other-provider',
+                'credential_pool': fallback_pool}, {'provider': 'openrouter', 'model': 'x'}
     monkeypatch.setattr('hermes_cli.runtime_provider.resolve_runtime_with_fallback', resolve)
     monkeypatch.setattr('hermes_cli.runtime_provider_custom._resolve_named_custom_runtime', lambda **kw: None)
     built = _execute(_minimax_frame(tmp_path, monkeypatch), monkeypatch)
     assert calls and built['api_key'] is None
+    assert built.get('credential_pool') is None
 
 
 def _kanban_failures():
