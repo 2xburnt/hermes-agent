@@ -59,10 +59,33 @@ CLI `show --json` and `kanban_show` expose the persisted contract.
 The shared `complete_task` boundary covers worker tools, CLI, review approval and
 dashboard completion. It reads classic branch protection and active ruleset
 required contexts, paginates exact-head check runs and legacy statuses, then
-re-reads the PR head/base. Optional failed/skipped telemetry does not veto accepted
-required checks. Missing, pending, failed, cancelled, timed-out, stale, skipped or
-neutral **required** evidence cannot complete the card. Neither can zero-run
-acceptance, unreadable policy or GitHub API failures. A repository without required
+re-reads the PR head/base. For each required context it selects the newest check
+per app and independently the latest legacy status; when both sources use that
+name, both must pass. App-pinned requirements cannot use another app or a legacy
+status. Completed exact-head check runs with `success`, `skipped` or `neutral`
+conclusions pass, matching GitHub's required-job semantics. The raw conclusion
+is retained. An emitted conditional job skip is not an absent workflow/context.
+
+For GitHub Actions, the gate also paginates head-filtered workflow runs using the
+assignee's **Actions read** permission. Eligible head-CI events are `push`,
+`pull_request` and `merge_group`; manual, target-context and downstream events do
+not substitute for head CI. This conservative gate policy is narrower than
+GitHub's general check API. Workflow generation precedes job ID when selecting
+evidence within each contributing workflow, so a delayed old job cannot hide
+newer failure or pending work. Independent workflows cannot supersede each
+other's current same-name failures. A newer
+run of the same workflow with no required job is pending/missing, not old success.
+An incomplete rerun remains pending because its suite can still contain the
+previous attempt's jobs. No passing whole-suite conclusion or nonempty
+`pull_requests` association is required. Unrelated optional workflows do not veto
+required jobs. Incomplete evidence, unknown Actions suites and searches at the
+1,000-result API cap fail closed.
+
+Optional failed/skipped telemetry does not veto accepted required checks.
+Missing, pending, failed, cancelled, timed-out, stale or unknown **required**
+evidence cannot complete the card. Neither can zero-run acceptance, unreadable
+policy or GitHub API failures. Legacy statuses still require `success`; invented
+`skipped`/`neutral` status states do not pass. A repository without required
 checks needs a local-only contract. `gh` must be authenticated with read access to
 the repository's checks and rules; no remote writes are performed by this gate.
 Acceptance reads run as the **assignee profile's** `gh` login — its `GH_TOKEN` /

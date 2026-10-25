@@ -177,31 +177,37 @@ def collect_acceptance(contract: str, published_pr: str | None,
             return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
                      paginate=True, profile_home=profile_home)
-        runs = [run for page in pages for run in page["check_runs"]]
-        if len({r["id"] for r in runs}) != pages[0]["total_count"]:
-            raise ValueError("Incomplete check-run pagination")
+        runs = _complete_runs(pages, "check_runs")
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
                                                        paginate=True, profile_home=profile_home) for s in page]
+        actions = [r for r in runs if r["app"]["id"] == 15368 and
+                   any(r["name"] == c and a in (None, -1, 15368) for c, a in required)]
+        workflows = _actions_workflows(repo, sha, profile_home) if actions else {}
         outcomes = []
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
                         (app_id in (None, -1) or r["app"]["id"] == app_id)]
             # Status APIs expose an actor, not the originating integration ID.
+            # A legacy status can satisfy an unpinned context, but never a check pinned to an app.
             observed = [s for s in statuses if s["context"] == context]
             latest = max(observed, key=lambda s: s["id"]) if observed else None
-            selected = matching + ([latest] if latest and app_id in (None, -1) else [])
+            selected = _latest_checks(matching, workflows)
+            if latest and app_id in (None, -1):
+                selected.append(("status", latest))
             if not selected:
                 if latest and app_id is not None and app_id != -1:
                     outcomes.append(_record_unverifiable_status(receipt, latest, sha, app_id))
                 else:
                     outcomes.append("missing")
                     receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})
-            for check in selected:
-                is_run = "conclusion" in check
+            for source, check in selected:
+                is_run = source != "status"
                 outcome = check.get("conclusion") if is_run else check["state"]
                 classification = _classify(check, sha, outcome, is_run)
+                if source == "workflow":
+                    classification = "missing" if check["status"] == "completed" else "pending"
                 outcomes.append(classification)
-                receipt["checks"].append({"name": context, "id": check["id"],
+                receipt["checks"].append({"name": context, "id": check["id"], "source": source,
                     "url": check.get("html_url") or check.get("target_url"),
                     "head_sha": check.get("head_sha", check.get("sha")),
                     "classification": classification, "conclusion": outcome})
@@ -245,6 +251,66 @@ def _record_unverifiable_status(receipt: dict, status: dict, sha: str, app_id: i
     return classification
 
 
+def _complete_runs(pages: list[dict] | dict, key: str) -> list[dict]:
+    if not isinstance(pages, list):
+        raise ValueError("Expected paginated run evidence")
+    total = pages[0]["total_count"]
+    runs = [run for page in pages for run in page[key]]
+    if (any(page["total_count"] != total for page in pages) or
+            len(runs) != total or len({r["id"] for r in runs}) != total):
+        raise ValueError("Incomplete or changing run pagination")
+    return runs
+
+
+def _actions_workflows(repo: str, sha: str, profile_home: str | None) -> dict:
+    pages = _api(f"repos/{repo}/actions/runs?head_sha={sha}&per_page=100",
+                 paginate=True, profile_home=profile_home)
+    runs = _complete_runs(pages, "workflow_runs")
+    # GitHub caps filtered Actions searches at 1,000 results. At the cap we
+    # cannot prove that no newer generation was omitted, even if counts agree.
+    if pages[0]["total_count"] >= 1000:
+        raise ValueError("Incomplete workflow-run pagination")
+    if any(r["head_sha"] != sha for r in runs):
+        raise ValueError("Workflow head does not match requested head")
+    return {r["check_suite_id"]: r for r in runs}
+
+
+def _latest_checks(matching: list[dict], workflows: dict) -> list[tuple[str, dict]]:
+    by_app = {}
+    for run in matching:
+        by_app.setdefault(run["app"]["id"], []).append(run)
+    selected = []
+    for app, checks in by_app.items():
+        if app == 15368:  # GitHub Actions: job creation order can lag workflow generation.
+            selected.extend(_latest_actions_checks(checks, workflows))
+        else:
+            selected.append(("check_run", max(checks, key=lambda r: r["id"])))
+    return selected
+
+
+def _latest_actions_checks(checks: list[dict], workflows: dict) -> list[tuple[str, dict]]:
+    events = {"push", "pull_request", "merge_group"}
+    candidates = [workflows[r["check_suite"]["id"]] for r in checks]
+    workflow_ids = {w["workflow_id"] for w in candidates if w["event"] in events}
+    latest = {}
+    for run in workflows.values():
+        workflow_id = run["workflow_id"]
+        if workflow_id not in workflow_ids or run["event"] not in events:
+            continue
+        if workflow_id not in latest or (run["id"], run["run_attempt"]) > (latest[workflow_id]["id"], latest[workflow_id]["run_attempt"]):
+            latest[workflow_id] = run
+    selected = []
+    # Independent workflows cannot supersede one another's same-name failures.
+    for newest in latest.values():
+        current = [r for r in checks if r["check_suite"]["id"] == newest["check_suite_id"]]
+        if not current or (newest["run_attempt"] > 1 and newest["status"] != "completed"):
+            # Reruns reuse suite IDs. Wait rather than accept the old attempt's jobs.
+            selected.append(("workflow", newest))
+        else:
+            selected.append(("check_run", max(current, key=lambda r: r["id"])))
+    return selected
+
+
 def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:
     if check.get("head_sha", check.get("sha")) != sha:
         return "stale"
@@ -252,4 +318,8 @@ def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:
         return "pending"
     if outcome is None:
         return "infra"
+    # GitHub accepts emitted skipped/neutral jobs, not absent workflows or
+    # legacy commit statuses with invented states. Keep the raw conclusion.
+    if is_run and outcome in {"skipped", "neutral"}:
+        return "success"
     return {"success": "success", "failure": "failure", "error": "infra", "pending": "pending"}.get(outcome, "infra")
