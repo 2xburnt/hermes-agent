@@ -379,9 +379,36 @@ def _notifier_collect(runner: Any, kb: Any, *, notifier_profile: Optional[str], 
     hosts; legacy rows without a profile stamp are visible only to the process
     holding the singleton dispatcher lock.
     """
-    return _Collector(
+    return _elect_wakers(_Collector(
         runner, kb, notifier_profile=notifier_profile, gc_due=gc_due, gc_retention_days=gc_retention_days,
-    ).collect()
+    ).collect())
+
+
+def _elect_wakers(deliveries: list[dict]) -> list[dict]:
+    """Wake each notifier profile once per task event, however many routes subscribe.
+
+    ``link_tasks`` inherits every parent's subscription and channel integrations subscribe
+    descendants to their own threads, so one card can hold many wake routes for one profile.
+    Each keys a different session; waking all of them starts concurrent turns that race on the
+    same card. Pings still go to every route; only the oldest route covering an event wakes.
+    Suppressed deliveries settle their cursor, so a later tick cannot wake them for this event.
+    Only ``notify+wake`` routes take part: for ``wake`` routes and non-push adapters the wake is
+    the sole delivery, and :meth:`_KanbanNotification.deliver` never silences those.
+    """
+    groups: dict[tuple, list[dict]] = {}
+    for d in deliveries:
+        sub = d["sub"]
+        if sub.get("delivery_mode") == "notify+wake":
+            groups.setdefault((d.get("board"), sub["task_id"], sub.get("notifier_profile") or ""), []).append(d)
+    for group in groups.values():
+        covered: set = set()
+        for d in sorted(group, key=lambda d: (int(d["sub"].get("created_at") or 0), d["sub"]["platform"],
+                                              d["sub"]["chat_id"], d["sub"].get("thread_id") or "")):
+            ids = {ev.id for ev in d["events"] if ev.kind in _WAKE_KINDS}
+            if ids and ids <= covered:
+                d["wake_elected_elsewhere"] = True
+            covered |= ids
+    return deliveries
 
 
 # --- Per-event message formatting: kind -> (msg, wake_handoff, wake_review_detail) ---
@@ -829,7 +856,7 @@ class _KanbanNotification:
         from gateway.wake import WakeNotAccepted
 
         # A requested wake is required even when its passive ping already landed.
-        if wake_payloads:
+        if wake_payloads and not (is_push and self.d.get("wake_elected_elsewhere")):
             try:
                 for self.synth, self.wake_diagnostic, self.wake_kinds in wake_payloads:
                     await self.wake()
