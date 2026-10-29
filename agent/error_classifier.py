@@ -16,6 +16,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence
 
+from agent.errors import CredentialPoolUnavailableError
+
 logger = logging.getLogger(__name__)
 
 # Synthetic code for the OpenAI SDK rejecting a provider's SSE ``data:`` field
@@ -973,6 +975,10 @@ def _gemini_prompt_block_marker(exc: Any) -> Optional[bool]:
 def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     """Highest-priority provider-specific shapes that a status code would misroute."""
     msg, status = c.msg, c.status_code
+    # No usable pooled credential was found before sending: a cooldown/exhaustion the pool already
+    # knows. Fall back (or wait), never rotate — there is no failed credential to bench.
+    if isinstance(c.error, CredentialPoolUnavailableError):
+        return _v(_R.rate_limit, should_fallback=True)
     # Deterministic for this context: another provider would receive the same connector result.
     if c.code == "data_policy_denied":
         return _v(_R.data_policy_denied, retryable=False, should_fallback=False)

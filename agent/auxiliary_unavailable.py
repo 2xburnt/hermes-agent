@@ -90,6 +90,40 @@ def pool_cooldown_message(provider_id: str) -> Optional[str]:
             "different provider with `hermes model`.")
 
 
+def pool_model_cooldown_message(provider_id: str, model: Optional[str]) -> Optional[str]:
+    """The "credential pool is in cooldown for <model>" error when every live credential is benched
+    for *model* only (a per-model 429) and other models stay usable; ``None`` otherwise. Reads the
+    pool the way the token gate (``token_is_blocked``) does: env-seeded rows carry their key only
+    once loaded, and a row shares the bench of every row holding the same key."""
+    from agent.credential_pool import STATUS_DEAD, load_pool
+    from agent.credential_pool_model_cooldowns import model_cooldown_until
+
+    entries = []
+    with contextlib.suppress(Exception):
+        entries = load_pool(provider_id).entries()
+    waits: dict[str, float] = {}
+    for entry in entries:
+        if entry.last_status != STATUS_DEAD:
+            key = entry.runtime_api_key or entry.id
+            waits[key] = max(waits.get(key, 0.0), model_cooldown_until(entry, model) or 0.0)
+    if not model or not waits or not all(waits.values()):
+        return None
+    when = safe_strftime(datetime.fromtimestamp(min(waits.values())).astimezone(), "%Y-%m-%d %H:%M %Z")
+    which = "its only credential is" if len(waits) == 1 else f"all {len(waits)} credentials are"
+    return (f"Provider '{provider_id}' credential pool is in cooldown for model '{model}': {which} "
+            f"rate-limited (429) for this model until {when}; other models stay available. Wait for "
+            f"the reset, clear it with `hermes auth reset {provider_id}`, or switch models with `hermes model`.")
+
+
+def credential_pool_unavailable_message(provider_id: str, model: Optional[str]) -> str:
+    """Why a provider whose agent was built without a key cannot serve *model*: a billing-burned
+    pool, a credential-wide cooldown, a per-model cooldown, else the generic exhausted/cooldown line."""
+    return (pool_billing_message(provider_id, model=model) or pool_cooldown_message(provider_id)
+            or pool_model_cooldown_message(provider_id, model)
+            or f"Provider '{provider_id}' has no usable credential for model '{model}': its credential pool "
+               f"is exhausted or in cooldown (see `hermes auth list {provider_id}`).")
+
+
 class ProviderCredentialsExhaustedError(RuntimeError):
     """An explicit provider's credential pool is fully exhausted (402 out of credits, quota bench).
 

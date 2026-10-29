@@ -12,6 +12,7 @@ new speed.
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any
 
@@ -20,6 +21,8 @@ DEFAULT_WINDOW_SECONDS = 60
 # Documented fast-mode rate-limit headers; a limit of 0 means the organization has no fast
 # capacity for the model (https://platform.claude.com/docs/en/build-with-claude/fast-mode).
 _FAST_LIMIT_HEADERS = ("anthropic-fast-input-tokens-limit", "anthropic-fast-output-tokens-limit")
+# The 429 body Anthropic returns when the account has no usage credits for fast mode (no limit headers).
+_FAST_UNAVAILABLE_MESSAGE = "required for fast mode"
 #: Tiers sent on every request of the session (OpenAI ``service_tier`` values; ``priority`` also
 #: selects Anthropic/xAI fast mode). Ultrafast is OpenAI-only and gated per model.
 STATIC_TIERS = frozenset({"priority", "ultrafast"})
@@ -76,7 +79,7 @@ def begin_turn(agent: Any, conversation_history: Any) -> None:
 
 def effective_request_overrides(agent: Any) -> dict[str, Any]:
     """``agent.request_overrides`` plus the fast override while the window is open, minus
-    ``speed`` for a model this session learned has no fast capacity."""
+    ``speed`` for a model whose fast mode this session saw refused (see :func:`fast_mode_refusal`)."""
     overrides = dict(getattr(agent, "request_overrides", None) or {})
     if getattr(agent, "service_tier", None) in BOUNDED_MODES and time.monotonic() < getattr(agent, "_fast_until", 0.0):
         from hermes_cli.models import resolve_fast_mode_overrides
@@ -86,7 +89,8 @@ def effective_request_overrides(agent: Any) -> dict[str, Any]:
         overrides.update(
             resolve_fast_mode_overrides(getattr(agent, "model", None), provider=getattr(agent, "provider", None), base_url=base_url) or {}
         )
-    if "speed" in overrides and getattr(agent, "model", None) in (getattr(agent, "_fast_mode_unavailable_models", None) or ()):
+    paused = getattr(agent, "_fast_mode_unavailable_models", None) or {}
+    if "speed" in overrides and paused.get(getattr(agent, "model", None), 0.0) > time.monotonic():
         overrides.pop("speed", None)
     from agent.codex_service_tiers import apply_daybreak, negotiate_request_tier
     negotiate_request_tier(agent, overrides)
@@ -94,27 +98,45 @@ def effective_request_overrides(agent: Any) -> dict[str, Any]:
     return overrides
 
 
-def fast_mode_unprovisioned(api_error: Any, api_kwargs: Any) -> bool:
-    """True for a 429 on a ``speed: "fast"`` request whose fast-mode limit header is 0. The
-    organization has no fast capacity for the model, so waiting or rotating keys cannot help."""
+def fast_mode_refusal(api_error: Any, api_kwargs: Any) -> float | None:
+    """Seconds to send the current model at standard speed after a 429 on a ``speed: "fast"``
+    request, or None when *api_error* is not one.
+
+    Fast mode is metered on its own limits, so such a 429 says nothing about the credential's
+    standard-speed standing and must never bench the (often shared) credential for the model.
+    ``inf`` (rest of the session) when the organization cannot use fast mode at all: a fast-mode
+    limit header of 0, "Usage credits are required for fast mode", or no fast-mode limit headers
+    at all. A spent fast window (non-zero limit) pauses fast mode until its ``retry-after``."""
     if getattr(api_error, "status_code", None) != 429 or not isinstance(api_kwargs, dict):
-        return False
+        return None
     if (api_kwargs.get("extra_body") or {}).get("speed") != "fast":
-        return False
-    headers = getattr(getattr(api_error, "response", None), "headers", None)
-    if headers is None:
-        return False
-    return any(str(headers.get(name, "")).strip() == "0" for name in _FAST_LIMIT_HEADERS)
+        return None
+    headers = getattr(getattr(api_error, "response", None), "headers", None) or {}
+    limits = [str(headers.get(name, "")).strip() for name in _FAST_LIMIT_HEADERS]
+    if _FAST_UNAVAILABLE_MESSAGE in str(api_error).lower() or "0" in limits or not any(limits):
+        return math.inf
+    try:
+        return max(float(headers.get("retry-after", DEFAULT_WINDOW_SECONDS)), 1.0)
+    except (TypeError, ValueError):
+        return float(DEFAULT_WINDOW_SECONDS)
 
 
-def mark_fast_mode_unavailable(agent: Any) -> bool:
-    """Stop sending ``speed`` for the current model for the rest of the session. False when the
-    model was already marked, so the caller retries at most once per model."""
+def mark_fast_mode_unavailable(agent: Any, seconds: float = math.inf) -> bool:
+    """Stop sending ``speed`` for the current model for *seconds* (default: the rest of the
+    session). False while the model is already paused, so the caller retries at most once."""
     model = getattr(agent, "model", None)
-    unavailable = getattr(agent, "_fast_mode_unavailable_models", None)
-    if not isinstance(unavailable, set):
-        unavailable = agent._fast_mode_unavailable_models = set()
-    if not model or model in unavailable:
+    paused = getattr(agent, "_fast_mode_unavailable_models", None)
+    if not isinstance(paused, dict):
+        paused = agent._fast_mode_unavailable_models = {}
+    now = time.monotonic()
+    if not model or paused.get(model, 0.0) > now:
         return False
-    unavailable.add(model)
+    paused[model] = now + seconds
     return True
+
+
+def fast_mode_notice(model: Any, seconds: float) -> str:
+    """The one-line status for :func:`mark_fast_mode_unavailable`."""
+    if math.isinf(seconds):
+        return f"⚠️  Fast mode isn't available for {model} on this Anthropic account — using standard speed for this session, retrying..."
+    return f"⚠️  Fast-mode rate limit reached for {model} — using standard speed for {seconds:.0f}s, retrying..."

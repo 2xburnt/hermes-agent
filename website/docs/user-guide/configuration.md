@@ -2211,7 +2211,7 @@ agent:
 
 Fast mode's speedup is in output tokens per second, so long answers gain the most.
 
-When an Anthropic organization has no fast-mode capacity for a model (the API answers a fast request with a fast-mode limit of 0), Hermes switches that model to standard speed for the rest of the session and retries the request.
+When Anthropic refuses a fast request with a 429, Hermes retries it at standard speed on the same credential and never records a rate-limit cooldown against the credential: fast mode has its own limits, so the refusal says nothing about standard speed. If the account cannot use fast mode for the model at all (a fast-mode limit of 0, "Usage credits are required for fast mode", or no fast-mode limit headers), that model stays at standard speed for the rest of the session; a spent fast-mode window pauses fast mode only until its `retry-after`.
 
 ### Fast tiers behind a gateway or proxy
 
