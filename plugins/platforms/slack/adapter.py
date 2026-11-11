@@ -4577,19 +4577,24 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             event = self._normalize_changed_message(event)
             if event is None:
                 return None
-        # Socket Mode redelivers after reconnects. Scope by workspace: ts is only unique per team.
-        # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777) Scope the dedup id by
-        # workspace: Slack event ts values are only unique within one workspace, so two teams' events with
-        # the same ts must not suppress each other.
+        # Slack Connect can deliver one message under both the local and external
+        # workspace IDs. With one installation the channel and timestamp identify
+        # both copies; separate installations still need workspace isolation.
         event_ts = event.get("_slack_changed_event_ts") or event.get("ts", "")
         dedup_team_id = self._event_team_id(event, payload, install_set=getattr(self, "_team_clients", None))
         if getattr(self, "_team_clients", None) and not dedup_team_id:
             logger.info("[Slack] Ignoring event with no authenticated workspace: type=%s channel=%s",
                         event.get("type"), event.get("channel", ""))
             return None
-        if event_ts and self._dedup.is_duplicate(self._workspace_event_id(dedup_team_id, event_ts)):
-            return None
         channel_id = event.get("channel", "")
+        if event_ts:
+            shared_channel = (payload or {}).get("is_ext_shared_channel") is True
+            if shared_channel and channel_id and len(self._team_clients) == 1:
+                dedup_id = f"slack-connect:{channel_id}:{event_ts}"
+            else:
+                dedup_id = self._workspace_event_id(dedup_team_id, event_ts)
+            if self._dedup.is_duplicate(dedup_id):
+                return None
         if self._is_ignored_channel(channel_id):
             logger.info("[Slack] Ignoring message in configured ignored channel %s", channel_id)
             return None
