@@ -1056,7 +1056,7 @@ def _all_sessions_opt_in(home: str) -> bool:
     message teammates from every session (desktop chats, Slack/Telegram/Discord threads),
     not only from its canonical Bot Chat. Local hetz patch. Never raises."""
     with contextlib.suppress(Exception):
-        import yaml
+        import hermes_yaml as yaml  # PyYAML is not in the Hermes venv; a bare `import yaml` always failed here
 
         cfg = yaml.safe_load((Path(home) / "config.yaml").read_text(encoding="utf-8")) or {}
         return bool(((cfg.get("agent") or {}).get("message_agent_all_sessions")))
