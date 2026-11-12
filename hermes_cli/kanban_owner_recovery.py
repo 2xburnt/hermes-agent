@@ -230,6 +230,12 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     dead.event_payload["attempt_note"] = note
     if lost:
         dead.event_payload["worker_lost"] = lost
+        if str(lost.get("reason") or "").startswith("EOFError"):
+            # The managed worker's pipe to the gateway closed: the gateway went away under it
+            # (a restart), whatever the worker was doing. Not the card's fault.
+            from hermes_cli.kanban_db_dispatch import GATEWAY_RESTART_MARKER
+            dead.restart_casualty = True
+            dead.event_payload[GATEWAY_RESTART_MARKER] = True
         if dead.protocol_violation:
             from hermes_cli.kanban_db_dispatch import _PROTOCOL_VIOLATION_ERROR
             dead.protocol_violation = False

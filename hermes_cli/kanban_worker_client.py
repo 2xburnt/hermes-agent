@@ -48,7 +48,8 @@ class _Claim:
 
 async def run(params, board_db):
     from agent.retry_utils import jittered_backoff
-    from hermes_cli.gateway_client import connect_gateway, GatewayClientError, outside_restart_wait
+    from hermes_cli.gateway_client import (
+        connect_gateway, GatewayClientError, OwnerRestartTimeout, outside_restart_wait)
     from hermes_cli.gateway_owner_restart import restartable
     from websockets.exceptions import WebSocketException
     if os.environ.get('HERMES_TUI_GATEWAY_URL'):
@@ -85,7 +86,7 @@ async def run(params, board_db):
                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
                 detail = exc if isinstance(exc, GatewayClientError) else type(exc).__name__ + (
                     f' (HTTP {status})' if status else '')
-                raise GatewayClientError(f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}') from exc
+                raise OwnerRestartTimeout(f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}') from exc
         else:
             return _exit_code(receipt, params, board_db)
         failures = 1 if claim.answered != seen else failures + 1
@@ -167,7 +168,13 @@ def _submit():
             os.environ.pop(key, None)
         return asyncio.run(run(params, board_db))
     except (KeyError, ValueError, OSError) as exc:
+        from hermes_cli.gateway_client import OwnerRestartTimeout
         print(f'Kanban owner refused: {exc}', file=sys.stderr)
+        if isinstance(exc, OwnerRestartTimeout):
+            # The host was restarting, not the card failing: the dispatcher requeues this exit
+            # without spending the card's failure budget.
+            from hermes_cli.kanban_db import KANBAN_OWNER_RESTART_EXIT_CODE
+            return KANBAN_OWNER_RESTART_EXIT_CODE
         return 1
 
 

@@ -314,6 +314,11 @@ KANBAN_RATE_LIMIT_EXIT_CODE = 75
 # the FIRST occurrence instead of spending ``failure_limit`` identical spawns. 78 == BSD EX_CONFIG.
 KANBAN_TERMINAL_PROVIDER_EXIT_CODE = 78
 
+# Worker exit "the profile owner stayed draining/restarting for the whole wait": a gateway restart
+# is the host's doing, not the card's, so the dispatcher requeues WITHOUT counting a failure (a
+# bounded streak still trips the breaker, ``_RESTART_CASUALTY_LIMIT``). 69 == BSD EX_UNAVAILABLE.
+KANBAN_OWNER_RESTART_EXIT_CODE = 69
+
 
 def _resolve_crash_grace_seconds() -> int:
     """``HERMES_KANBAN_CRASH_GRACE_SECONDS`` (0 = immediate, for tests) else default."""
