@@ -1180,6 +1180,43 @@ class TestStandaloneSendUserDmResolution:
         assert "chat.postMessage" in session.post.call_args.args[0]
 
     @pytest.mark.asyncio
+    async def test_user_prefixed_target_resolves_dm_before_post(self):
+        """Cron ``deliver=slack:U...`` reaches _standalone_send as ``user:U...``."""
+        _slack_mod._slack_dm_cache.clear()
+        open_resp = self._mock_resp({"ok": True, "channel": {"id": "D777666555"}})
+        post_resp = self._mock_resp({"ok": True, "ts": "123.456"})
+        session = self._mock_session(open_resp, post_resp)
+        config = PlatformConfig(enabled=True, token="***")
+
+        with patch.object(_slack_mod.aiohttp, "ClientSession", return_value=session):
+            result = await _slack_mod._standalone_send(
+                config, "user:U1234509876", "hello dm")
+
+        assert result["success"] is True
+        assert result["chat_id"] == "D777666555"
+        assert session.post.call_count == 2
+        assert "conversations.open" in session.post.call_args_list[0].args[0]
+        assert session.post.call_args_list[0].kwargs["json"] == {"users": "U1234509876"}
+        assert "chat.postMessage" in session.post.call_args_list[1].args[0]
+        assert session.post.call_args_list[1].kwargs["json"]["channel"] == "D777666555"
+        _slack_mod._slack_dm_cache.clear()
+
+    @pytest.mark.asyncio
+    async def test_user_prefixed_open_failure_reports_resolution_error(self):
+        _slack_mod._slack_dm_cache.clear()
+        open_resp = self._mock_resp({"ok": False, "error": "missing_scope"})
+        session = self._mock_session(open_resp)
+        config = PlatformConfig(enabled=True, token="***")
+
+        with patch.object(_slack_mod.aiohttp, "ClientSession", return_value=session):
+            result = await _slack_mod._standalone_send(
+                config, "user:U1234509876", "hello dm")
+
+        assert "resolution failed" in result["error"]
+        assert session.post.call_count == 1
+        _slack_mod._slack_dm_cache.clear()
+
+    @pytest.mark.asyncio
     async def test_channel_delivery_honors_unfurl_config(self):
         _slack_mod._slack_dm_cache.clear()
         post_resp = self._mock_resp({"ok": True, "ts": "123.456"})
@@ -4426,6 +4463,32 @@ class TestEnsureDmConversation:
         adapter._app.client.conversations_open.assert_awaited_once_with(
             users="U123ABCDEF"
         )
+
+    @pytest.mark.asyncio
+    async def test_user_prefixed_target_is_opened_as_dm(self, adapter):
+        """Cron ``deliver=slack:U...`` arrives as ``user:U...`` (send-target parser form)."""
+        adapter._app.client.conversations_open = AsyncMock(
+            return_value={"ok": True, "channel": {"id": "D999NEW"}}
+        )
+
+        resolved = await adapter._ensure_dm_conversation("user:U123ABCDEF")
+
+        assert resolved == "D999NEW"
+        adapter._app.client.conversations_open.assert_awaited_once_with(
+            users="U123ABCDEF"
+        )
+
+    @pytest.mark.asyncio
+    async def test_user_prefixed_and_bare_share_one_cache_entry(self, adapter):
+        adapter._app.client.conversations_open = AsyncMock(
+            return_value={"ok": True, "channel": {"id": "D999NEW"}}
+        )
+
+        first = await adapter._ensure_dm_conversation("user:U123ABCDEF")
+        second = await adapter._ensure_dm_conversation("U123ABCDEF")
+
+        assert first == second == "D999NEW"
+        adapter._app.client.conversations_open.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_conversation_ids_pass_through(self, adapter):

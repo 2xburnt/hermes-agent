@@ -1976,7 +1976,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         right bot token, and results are cached per (team, user) so repeated sends don't re-open. See
         #17261, #19236.
         """
-        cid = str(chat_id or "")
+        cid = _strip_slack_user_prefix(chat_id)
         if not cid or cid[0] not in ("U", "W"):
             return chat_id
         cache_key = f"{team_id or ''}:{cid}"
@@ -6733,6 +6733,15 @@ async def _slack_json_post(session, token: str, method: str, payload: dict, req_
         return await resp.json()
 
 
+def _strip_slack_user_prefix(chat_id: Any) -> str:
+    """``user:U...`` (the send-target parser's form for a Slack user, which cron ``deliver=slack:U...``
+    resolves to) -> bare ``U...``; anything else is returned as a string unchanged. Without this the
+    U/W check misses the prefixed form, conversations.open is skipped and chat.postMessage answers
+    channel_not_found. ``user_name:`` (users.list) is not handled here."""
+    cid = str(chat_id or "")
+    return cid[len("user:"):].strip() if cid.startswith("user:") else cid
+
+
 async def _resolve_slack_user_dm(token: str, user_id: str) -> Optional[str]:
     """Resolve a user ID (U.../W...) to a DM conversation ID (D...) via ``conversations.open``;
     cached per (token, user). None on failure (e.g. missing ``im:write``)."""
@@ -6913,7 +6922,7 @@ async def _standalone_send(
     # User-targeted delivery: chat.postMessage / files_upload_v2 reject bare user IDs (U.../W...) — resolve
     # to a DM conversation ID (D...) first via conversations.open so `deliver=slack:U…` cron jobs reach the
     # user's DM instead of failing with channel_not_found (#17444).
-    chat_id = str(chat_id or "")
+    chat_id = _strip_slack_user_prefix(chat_id)
     if chat_id[:1] in ("U", "W"):
         resolved = None
         for _tok in tokens:
