@@ -421,7 +421,21 @@ def _sanitize_slack_name(raw: str) -> str:
     return _SLACK_INVALID_CHARS.sub("", raw.lower()).strip("-_")[:_SLACK_NAME_LIMIT]
 
 
-def slack_native_slashes() -> list[tuple[str, str, str]]:
+def slack_command_prefix(extra: Mapping[str, Any]) -> str:
+    """Return the configured Slack namespace including its separating hyphen."""
+    prefix = extra.get("command_prefix", "")
+    if prefix == "":
+        return ""
+    max_prefix_length = _SLACK_NAME_LIMIT - len("/-hermes")
+    if (not isinstance(prefix, str) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", prefix)
+            or len(prefix) > max_prefix_length):
+        raise ValueError(
+            "platforms.slack.extra.command_prefix must be a lowercase hyphenated name "
+            f"of at most {max_prefix_length} characters")
+    return f"{prefix}-"
+
+
+def slack_native_slashes(prefix: str = "") -> list[tuple[str, str, str]]:
     """(slash_name, description, usage_hint) triples for Slack: every gateway-available command
     (canonical names first so they win slots at the cap, then aliases, then plugins) becomes a
     standalone slash, deduped and clamped to the 50-command cap; Slack built-ins and
@@ -433,26 +447,28 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     wanted += [(name, desc, hint or "") for name, desc, hint in _iter_plugin_command_entries()]
 
     entries: list[tuple[str, str, str]] = [
-        ("hermes", t("slash.hermes.description"), "[subcommand] [args]")]
+        (f"{prefix}hermes", t("slash.hermes.description"), "[subcommand] [args]")]
     seen = {"hermes"}
     for name, desc, hint in wanted:
         slack_name = _sanitize_slack_name(name)
         if (not slack_name or slack_name in seen or slack_name in _SLACK_RESERVED_COMMANDS
+                or (prefix and len(prefix) + len(slack_name) + 1 > _SLACK_NAME_LIMIT)
                 or slack_name in _SLACK_VIA_HERMES_ONLY
                 or len(entries) >= _SLACK_MAX_SLASH_COMMANDS):
             continue
         # Slack description cap is 2000 chars; keep it short.
-        entries.append((slack_name, desc[:140], hint[:100]))
+        entries.append((f"{prefix}{slack_name}", desc[:140], hint[:100]))
         seen.add(slack_name)
     return entries
 
 
 def slack_app_manifest(
-    request_url: str = "https://hermes-agent.local/slack/commands") -> dict[str, Any]:
+    request_url: str = "https://hermes-agent.local/slack/commands", *,
+    prefix: str = "") -> dict[str, Any]:
     """``features.slash_commands`` manifest portion only (decoupled from the rest of the manifest
     users configure in the Slack UI); ``request_url`` is schema-required, ignored in Socket Mode."""
     slashes = []
-    for name, desc, usage in slack_native_slashes():
+    for name, desc, usage in slack_native_slashes(prefix):
         entry = {"command": f"/{name}", "description": desc or t("slash.shared.plugin_default_desc", name=name),
                  "should_escape": False, "url": request_url}
         if usage:

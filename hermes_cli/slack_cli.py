@@ -12,7 +12,8 @@ SLACK_LONG_DESCRIPTION_MAX_CHARACTERS = 4000
 
 def _build_full_manifest(
     bot_name: str, bot_description: str, include_assistant: bool = True,
-    messaging_experience: str | None = None, long_description: str | None = None) -> dict:
+    messaging_experience: str | None = None, long_description: str | None = None,
+    prefix: str = "") -> dict:
     """Build a full Slack manifest: display info + slash list from ``COMMAND_REGISTRY``.
 
     Other sections (OAuth scopes, socket mode) are sensible Hermes defaults, tweakable in the Slack
@@ -31,7 +32,7 @@ def _build_full_manifest(
             "messages_tab_enabled": True,
             "messages_tab_read_only_enabled": False},
         "bot_user": {"display_name": bot_name[:80], "always_online": True},
-        "slash_commands": slack_app_manifest()["features"]["slash_commands"]}
+        "slash_commands": slack_app_manifest(prefix=prefix)["features"]["slash_commands"]}
 
     bot_scopes = [
         "app_mentions:read", "channels:history", "channels:read", "chat:write", "commands",
@@ -113,13 +114,21 @@ def slack_manifest_command(args) -> int:
     else:
         messaging_experience = "assistant"
 
+    from hermes_cli.config_effective import load_user_config_effective
+    from hermes_cli.commands_platforms import slack_app_manifest, slack_command_prefix
+    try:
+        config = load_user_config_effective(fail_closed=True)
+        extra = config.get("platforms", {}).get("slack", {}).get("extra", {})
+        prefix = slack_command_prefix(extra)
+    except Exception as exc:
+        return fail(f"cannot load Slack configuration: {exc}")
+
     if slashes_only:
-        from hermes_cli.commands_platforms import slack_app_manifest
-        manifest = slack_app_manifest()["features"]["slash_commands"]
+        manifest = slack_app_manifest(prefix=prefix)["features"]["slash_commands"]
     else:
         manifest = _build_full_manifest(
             name, description, messaging_experience=messaging_experience,
-            long_description=long_description)
+            long_description=long_description, prefix=prefix)
     payload = json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
 
     write_target = getattr(args, "write", None)

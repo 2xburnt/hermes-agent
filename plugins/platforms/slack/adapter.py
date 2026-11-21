@@ -1041,6 +1041,8 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SLACK)
+        from hermes_cli.commands_platforms import slack_command_prefix
+        self._slash_prefix = slack_command_prefix(config.extra)
         self._app: Optional[Any] = None
         self._handler: Optional[Any] = None
         self._socket_mode_task: Optional[asyncio.Task] = None
@@ -1654,12 +1656,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         # ALSO be declared in the app manifest (`hermes slack manifest`): Socket Mode won't
         # deliver undeclared commands at all.
         from hermes_cli.commands_platforms import slack_native_slashes
-        _slash_names = [name for name, _d, _h in slack_native_slashes()]
-        if _slash_names:
-            _slash_pattern = re.compile(
-                r"^/(?:" + "|".join(re.escape(n) for n in _slash_names) + r")$")
-        else:  # pragma: no cover - registry always non-empty
-            _slash_pattern = re.compile(r"^/hermes$")
+        _slash_names = [name for name, _d, _h in slack_native_slashes(self._slash_prefix)]
+        _slash_pattern = re.compile(
+            r"^/(?:" + "|".join(re.escape(n) for n in _slash_names) + r")$")
 
         self._app.command(_slash_pattern)(self._handle_hermes_command)
 
@@ -6229,7 +6228,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         team_id = command.get("team_id", "")
         if team_id and channel_id:
             self._remember_channel_team(channel_id, team_id)
-        text = slash_command_text(command)
+        text = slash_command_text(command, prefix=self._slash_prefix)
         thread_id = slash_thread_id(command)
         if self._slash_channel_gated(channel_id):
             logger.debug("[Slack] Ignoring slash command in ignored/non-allowed channel: %s", channel_id)
