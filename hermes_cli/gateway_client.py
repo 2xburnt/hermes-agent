@@ -49,6 +49,10 @@ class GatewayClientError(ValueError):
     pass
 
 
+class OwnerRestartTimeout(GatewayClientError):
+    """A Kanban worker's owner stayed restarting, draining or unreachable for the whole wait."""
+
+
 DISCONNECTED = ("Gateway disconnected; turn outcome is unknown. "
                 "Resume the printed session ID to check whether it completed or was interrupted; do not resend the work.")
 # A request refused before it reached any socket: nothing is in doubt, so never DISCONNECTED.

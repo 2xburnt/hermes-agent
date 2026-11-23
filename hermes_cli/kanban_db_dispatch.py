@@ -253,6 +253,8 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("rate_limited", code)
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
+    if code == _kb.KANBAN_OWNER_RESTART_EXIT_CODE:
+        return ("owner_restart", code)
     return ("nonzero_exit", code)
 
 
@@ -971,6 +973,30 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
+GATEWAY_RESTART_MARKER = "gateway_restart"  # run-metadata flag: a restart, not the card, ended it
+
+# A card that is restart-killed this many times in a row is no longer treated as a bystander: a
+# card that itself takes the gateway down must still reach the breaker.
+_RESTART_CASUALTY_LIMIT = 5
+
+
+def _restart_casualty_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """Trailing run of closed runs booked as gateway-restart casualties (newest first)."""
+    streak = 0
+    rows = conn.execute(
+        "SELECT outcome, metadata FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?", (task_id, _RESTART_CASUALTY_LIMIT + 2),
+    ).fetchall()
+    for row in rows:
+        if row["outcome"] == "rate_limited":
+            continue
+        if row["outcome"] == "crashed" and _kb._json_dict(row["metadata"]).get(GATEWAY_RESTART_MARKER):
+            streak += 1
+            continue
+        break
+    return streak
+
+
 WORKER_OUTPUT_SEP = " Worker's last output: "  # dead-worker error text: our words, then the worker's
 _PROTOCOL_VIOLATION_ERROR = (
     # Worker subprocess returned 0 but its task is still ``running`` in the DB — it exited without calling
@@ -1051,6 +1077,10 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    restart_casualty: bool = False
+    """A gateway restart ended the attempt (``KANBAN_OWNER_RESTART_EXIT_CODE``, or the owner's
+    ``worker_lost: EOFError``): booked ``crashed`` but not counted against the breaker, up to
+    ``_RESTART_CASUALTY_LIMIT`` in a row."""
 
     @property
     def run_outcome(self) -> str:
@@ -1123,6 +1153,14 @@ def _classify_dead_worker_exit(
             "rate_limited",
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
+        )
+    if kind == "owner_restart":
+        return _DeadWorker(
+            kind, code,
+            f"pid {pid} gave up waiting for a restarting gateway owner (exit {code})",
+            "crashed",
+            {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code, GATEWAY_RESTART_MARKER: True},
+            restart_casualty=True,
         )
     if kind == "terminal_provider":
         # The worker classified its own provider failure as unhealable (credential
@@ -1223,7 +1261,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.protocol_violation or dead.restart_casualty:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a below-budget protocol violation never reaches
@@ -1253,10 +1291,16 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
     for _, _, _, dead in crash_details:
+        if dead.restart_casualty:
+            continue  # one restart kills many workers; that is not a systemic task error
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
     for tid, pid, claimer, dead in crash_details:
         error_text = dead.error_text
+        if dead.restart_casualty and _restart_casualty_streak(conn, tid) <= _RESTART_CASUALTY_LIMIT:
+            # Requeued already, error stamped, run closed ``crashed`` with the restart marker; the
+            # unified failure budget is untouched.
+            continue
         if dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
             trow = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()
@@ -1570,9 +1614,11 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
-    handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
+    (PR URL in a recent comment; re-spawning risks a duplicate PR — unless an
+    explicit unblock/queue move is awaiting its next claim, or a handoff event
+    followed the comment: the named profile must work on that PR). Operator
+    requeues also admit their follow-up PR context comments, until claimed.
+    The review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
     """
@@ -1638,6 +1684,14 @@ def check_respawn_guard(
     if success is not None and not any(_rows_since(
             conn, "task_events", task_id, success, "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed')")):
         return "recent_success"
+
+    # An explicit unblock/queue move authorizes the next claim even when its
+    # explanatory comment links a PR AFTER the requeue. Do not add GitHub I/O
+    # here: this guard executes on every dispatch tick under the board lock.
+    from hermes_cli.kanban_respawn_policy import has_pending_operator_requeue
+
+    if has_pending_operator_requeue(conn, task_id):
+        return None
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     #    Exception: a handoff AFTER the newest PR comment (operator reassign,

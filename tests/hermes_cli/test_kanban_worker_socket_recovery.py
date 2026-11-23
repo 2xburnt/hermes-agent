@@ -256,3 +256,35 @@ async def test_a_refused_ticket_reads_like_a_refusing_owner(monkeypatch, _worker
         async with gateway_client.connect_gateway():
             pass
     assert (raised.value.state, raised.value.reason_code) == ("inaccessible", "invalid_control_response")
+
+
+@pytest.mark.asyncio
+async def test_an_owner_that_never_came_back_is_a_restart_timeout_not_a_card_failure(monkeypatch, _worker_env, clock):
+    owner = _Owner(connects=[None], receipts=["pending", _disconnect()],
+                   after=GUE("Gateway draining: restart_wait", "draining", "restart_wait"))
+    with pytest.raises(gateway_client.OwnerRestartTimeout, match="owner silent for 1[89]\\ds"):
+        await _run(owner, monkeypatch, _worker_env)
+
+
+def test_submit_exits_with_the_restart_code_when_the_owner_stays_gone(monkeypatch):
+    from hermes_cli import kanban_db
+
+    async def _gone(params, board_db):
+        raise gateway_client.OwnerRestartTimeout("Kanban owner silent for 185s: Gateway draining: restart_wait")
+
+    for key, value in {"HERMES_KANBAN_BOARD": "b", "HERMES_KANBAN_TASK": "t", "HERMES_KANBAN_RUN_ID": "1",
+                       "HERMES_KANBAN_CLAIM_LOCK": "l", "HERMES_KANBAN_DB": "/x/kanban.db"}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(kanban_worker_client, "run", _gone)
+    assert kanban_worker_client._submit() == kanban_db.KANBAN_OWNER_RESTART_EXIT_CODE
+
+
+def test_a_real_owner_refusal_still_exits_1(monkeypatch):
+    async def _refused(params, board_db):
+        raise gateway_client.GatewayClientError("Gateway inaccessible: unsafe_socket")
+
+    for key, value in {"HERMES_KANBAN_BOARD": "b", "HERMES_KANBAN_TASK": "t", "HERMES_KANBAN_RUN_ID": "1",
+                       "HERMES_KANBAN_CLAIM_LOCK": "l", "HERMES_KANBAN_DB": "/x/kanban.db"}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(kanban_worker_client, "run", _refused)
+    assert kanban_worker_client._submit() == 1

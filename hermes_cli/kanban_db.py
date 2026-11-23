@@ -107,7 +107,7 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
-# Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
+# Typed block reasons (routing in kanban_db_block); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
@@ -313,6 +313,11 @@ KANBAN_RATE_LIMIT_EXIT_CODE = 75
 # (404), TLS chain broken — a retry cannot fix it, so the dispatcher parks the card blocked on
 # the FIRST occurrence instead of spending ``failure_limit`` identical spawns. 78 == BSD EX_CONFIG.
 KANBAN_TERMINAL_PROVIDER_EXIT_CODE = 78
+
+# Worker exit "the profile owner stayed draining/restarting for the whole wait": a gateway restart
+# is the host's doing, not the card's, so the dispatcher requeues WITHOUT counting a failure (a
+# bounded streak still trips the breaker, ``_RESTART_CASUALTY_LIMIT``). 69 == BSD EX_UNAVAILABLE.
+KANBAN_OWNER_RESTART_EXIT_CODE = 69
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -3127,7 +3132,7 @@ def block_task(
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
-    :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
+    :func:`hermes_cli.kanban_db_block.route_block`). ``kind='dependency'`` with no incomplete parent is
     re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
     promote it into a context-free respawn. ``transient`` still counts
     toward the loop breaker so a forever-flaky task escalates. True on any
@@ -3140,6 +3145,8 @@ def block_task(
     runs stay exactly as the breaker left them. A typed block, a card with a
     live run, or a kind-less call on a blocked card are still refused.
     """
+    from hermes_cli.kanban_db_block import route_block
+
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     with write_txn(conn):
@@ -3180,8 +3187,8 @@ def block_task(
         if kind == "dependency" and _parents_satisfied(conn, task_id):
             kind = "needs_input"
             rekind_reason = "no_open_parent"
-        new_status, event_kind, set_sql, params, payload = _route_block(
-            kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
+        new_status, event_kind, set_sql, params, payload = route_block(
+            conn, task_id, kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
         )
         if rekind_reason:
@@ -3210,35 +3217,6 @@ def block_task(
         blocked_task = get_task(conn, task_id)
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
-
-
-def _route_block(
-    kind: Optional[str], reason: Optional[str], source_status: str, *,
-    prev_kind: Optional[str], prev_recurrences: int,
-) -> tuple[str, str, str, tuple, dict]:
-    """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
-
-    ``dependency`` never enters the human ``blocked`` bucket: it waits in
-    ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
-    as something to "unblock". Callers that pass ``dependency`` with no
-    incomplete parent are re-kinded to ``needs_input`` before this runs
-    (see :func:`block_task`). Every other kind counts unblock-loop
-    recurrences: block_task only fires from running/ready (AFTER an unblock
-    returned the task to the pool), so a stored ``block_kind`` equal to the
-    incoming one means blocked -> unblocked -> re-block for the same cause
-    (un-typed None compares equal to a prior un-typed block). At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
-    """
-    payload = {"reason": reason, "kind": kind, "source_status": source_status}
-    if kind == "dependency":
-        return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
-    recurrences = prev_recurrences + 1 if prev_kind == kind else 1
-    set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
-    payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
-    if recurrences >= BLOCK_RECURRENCE_LIMIT:
-        payload["limit"] = BLOCK_RECURRENCE_LIMIT
-        return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
-    return "blocked", "blocked", set_sql, (kind, recurrences), payload
 
 
 def redact_review_value(value: Any) -> Any:
@@ -3577,7 +3555,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
         # resetting them is the amnesia that let cron-unblock <-> re-block loop
-        # unbounded; only complete_task clears them. ``consecutive_failures``
+        # unbounded; fresh outside input is checked on re-block. ``consecutive_failures``
         # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
         # is a fresh start for the retry budget.
         cur = conn.execute(
