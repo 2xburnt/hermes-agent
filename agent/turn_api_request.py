@@ -112,6 +112,21 @@ def _fire_pre_api_request_hook(
         pass
 
 
+def ensure_request_credential(agent: Any) -> None:
+    """Native Anthropic built with no key (every pooled credential was exhausted or in a cooldown
+    for the model when the agent was constructed) re-resolves once per attempt, so a lifted
+    cooldown heals the session; otherwise raise the pool's state by name instead of letting the SDK
+    fail with ``TypeError: Could not resolve authentication method``."""
+    if (agent.api_mode != "anthropic_messages" or agent.provider != "anthropic"
+            or getattr(agent, "_anthropic_api_key", "set") or agent._try_refresh_anthropic_client_credentials()):
+        return
+    from agent.auxiliary_unavailable import credential_pool_unavailable_message
+    from agent.errors import CredentialPoolUnavailableError
+    raise CredentialPoolUnavailableError(
+        credential_pool_unavailable_message("anthropic", agent.model), provider="anthropic", model=agent.model,
+    )
+
+
 def build_request_payload(
     agent: Any, *, api_messages: Any, _moa_prepared_request: Any, tools_for_api: Any,
     system_message: Any, api_call_count: Any, api_request_id: Any, effective_task_id: Any,
@@ -140,6 +155,7 @@ def build_request_payload(
     # A model that rejected image content gets text only; history keeps the images.
     strip_images_for_rejecting_model(agent, api_messages)
     observe_request_tools(agent, tools_for_api)
+    ensure_request_credential(agent)  # before kwargs: a refreshed OAuth key changes their shape
     if tools_for_api == agent.tools:
         api_kwargs = agent._build_api_kwargs(api_messages)
     else:

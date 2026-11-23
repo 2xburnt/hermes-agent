@@ -1971,6 +1971,64 @@ class TestTwoFactor:
         # the real widget
         assert [f["value"] for f in build_otp_fills([ctl(i + 4, maxlen=1) for i in range(6)], "246810")] == list("246810")
 
+    # Google's 2-Step Verification page (accounts.google.com/v3/signin/challenge/totp): the code box has
+    # no autocomplete=one-time-code, only a camelCase name/id.
+    #   <input type="tel" name="totpPin" id="totpPin" autocomplete="off" pattern="[0-9 ]*"
+    #          aria-label="Enter code" dir="ltr">
+    #   <input type="checkbox" id="..."> Don't ask again on this device
+    # Rows below are what build_inspection_js reports for it (name = "<name> <id>").
+    _GOOGLE_TOTP_PAGE = [
+        {"index": 0, "type": "tel", "name": "totpPin totpPin", "label": "  Enter code   ", "autocomplete": "off",
+         "formIndex": 0, "maxLength": None},
+    ]
+
+    def test_google_totp_pin_field_is_a_code_field(self):
+        from agent.vault_login_classifier import classify_otp_controls
+
+        found = classify_otp_controls([LoginControl.from_dict(r) for r in self._GOOGLE_TOTP_PAGE])
+        assert [(c.control.index, c.token, c.score) for c in found] == [(0, "one-time-code", 70)]
+        # other camelCase spellings of the same thing
+        for name in ("otpCode", "verificationCode", "mfaToken", "twoFactorCode", "smsPin", "totpPinInput"):
+            assert classify_otp_controls([_ctrl(type="tel", name=name, label="")]), name
+        # ...but camelCase alone doesn't make an unrelated field a code field
+        for name in ("promoCode", "zipCode", "postalCode", "couponCode", "searchQuery", "optIn", "pinCode"):
+            assert not classify_otp_controls([_ctrl(type="text", name=name, label="")]), name
+        # the login/checkout classifiers are untouched: totpPin is never a login fill target
+        login = classify_login_control(_ctrl(type="tel", name="totpPin totpPin", label="Enter code"))
+        assert login is not None and login.token == "tel"
+
+    def test_enter_code_fills_google_totp_pin(self, store):
+        """browser_vault_enter_code on Google's TOTP page fills #totpPin with the minted code, still asserting
+        the page's own origin in the fill script (no origin rule changed)."""
+        from agent.vault_backends import unlock as unlock_mod
+        from tools import browser_vault_tool
+
+        meta = store.add_item("login", "google", {"identifier_type": "email", "identifier": "a@example.com",
+                                                  "password": "pw", "otp_secret": "JBSWY3DPEHPK3PXP"},
+                              origin="https://accounts.google.com")
+        unlock_mod.set_code_prompt_callback(lambda site, hint: pytest.fail("must not prompt when a key is saved"))
+        seen = {}
+        fake_eval = lambda t, e: {"success": True, "result": json.dumps(self._GOOGLE_TOTP_PAGE) if "querySelectorAll" in e
+                                  else "https://accounts.google.com/v3/signin/challenge/totp?TL=x"}
+
+        def fake_secret(t, e):
+            seen["expr"] = e
+            return {"success": True, "result": json.dumps({"filled": 1})}
+
+        try:
+            with patch("agent.vault_store.get_vault_store", return_value=store), \
+                 patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+                 patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
+                 patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_secret):
+                raw = browser_vault_tool.browser_vault_enter_code(meta.id, task_id="t")
+        finally:
+            unlock_mod.set_code_prompt_callback(None)
+        out = json.loads(raw)
+        assert out["success"] and out["filled_fields"] == 1 and out["origin"] == "https://accounts.google.com"
+        m = re.search(r'"index": 0, "token": "one-time-code", "value": "(\d{6})"', seen["expr"])
+        assert m and m.group(1) not in raw
+        assert 'window.location.origin !== "https://accounts.google.com"' in seen["expr"]
+
     def test_no_code_field_points_at_passkey_or_device_approval(self):
         from tools import browser_vault_tool
 

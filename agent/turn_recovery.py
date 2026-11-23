@@ -18,10 +18,11 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.conversation_compression import COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE
-from agent.fast_mode import fast_mode_unprovisioned, mark_fast_mode_unavailable
+from agent.fast_mode import fast_mode_notice, fast_mode_refusal, mark_fast_mode_unavailable
 from agent.model_metadata import is_output_cap_error, parse_available_output_tokens_from_error
 from agent.retry_utils import is_zai_coding_overload_error, zai_coding_overload_retry_ceiling
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.errors import CredentialPoolUnavailableError
 from agent.message_sanitization import (
     _looks_like_corrupt_image_rejection, _looks_like_image_content_rejection, _messages_carry_images,
     _sanitize_messages_non_ascii,
@@ -253,12 +254,12 @@ def recover_before_classification(
         if _recovered:
             return True, active_system_prompt
 
-    # Anthropic fast mode with no capacity: a 429 whose fast-mode limit header is 0 can never
-    # succeed at fast speed, and it says nothing about the key's standard-speed limits. Stop
-    # sending ``speed`` to this model and retry now, before credential rotation benches the key.
-    if fast_mode_unprovisioned(api_error, api_kwargs) and mark_fast_mode_unavailable(agent):
-        _vlines(agent, f"⚠️  Fast mode isn't available for {agent.model} on this Anthropic organization — using standard speed for this session, retrying...")
-        logger.warning("%sFast mode: %s has a fast-mode limit of 0; standard speed for this session", agent.log_prefix, agent.model)
+    # A 429 on a fast request is about fast mode alone (separate limits; no credits for it), never
+    # the key's standard-speed standing. Drop ``speed`` for this model and retry on the same
+    # credential now, before rate-limit handling writes a model cooldown onto a shared pool entry.
+    if (_fast_pause := fast_mode_refusal(api_error, api_kwargs)) is not None and mark_fast_mode_unavailable(agent, _fast_pause):
+        _vlines(agent, fast_mode_notice(agent.model, _fast_pause))
+        logger.warning("%sFast mode refused for %s (%s); standard speed for %ss", agent.log_prefix, agent.model, api_error, _fast_pause)
         return True, active_system_prompt
 
     # Some providers 4xx on image_url content: record the (provider, model) and retry;
@@ -635,6 +636,19 @@ def _pool_error_context(agent, classified: Any, error_context: Any) -> Any:
             **_usage_window_reset_context(agent)}
 
 
+def _recover_with_pool(agent, api_error, classified, _retry, status_code, error_context) -> bool:
+    """Credential-pool rotation for a failed call. A missing local credential sent nothing, so
+    there is no failed key for the pool to bench."""
+    if isinstance(api_error, CredentialPoolUnavailableError):
+        return False
+    recovered, _retry.has_retried_429 = agent._recover_with_credential_pool(
+        status_code=status_code, has_retried_429=_retry.has_retried_429,
+        classified_reason=classified.reason, error_context=_pool_error_context(agent, classified, error_context),
+        billing_unverified=classified.billing_unverified,
+    )
+    return recovered
+
+
 def _usage_window_reset_context(agent) -> dict[str, float]:
     """``{"reset_at": epoch s}`` for a usage-window 402: when the refused allowance frees up, from the usage
     headers the 402 carried (the API's error body has no reset). Empty when the state names none, so the
@@ -696,11 +710,7 @@ def recover_after_classification(
             _vlines(agent, "🔐 Nous paid access verified — refreshed runtime credentials and retrying request...")
             return True, False
 
-    recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
-        status_code=status_code, has_retried_429=_retry.has_retried_429,
-        classified_reason=classified.reason, error_context=_pool_error_context(agent, classified, error_context),
-        billing_unverified=classified.billing_unverified,
-    )
+    recovered_with_pool = _recover_with_pool(agent, api_error, classified, _retry, status_code, error_context)
     if recovered_with_pool:
         return True, recovered_with_pool
 

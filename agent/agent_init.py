@@ -2145,9 +2145,9 @@ def init_agent(
     # Routes that rejected image content / named reasoning keys; build_api_request strips those from wire copies only.
     agent._image_rejecting_models = set()
     agent._reasoning_rejecting_routes = {}  # (provider, host, model) -> rejected reasoning keys
-    # Models whose Anthropic organization answered a fast request with a fast-mode limit of 0;
-    # agent.fast_mode stops sending ``speed`` to them for the rest of the session.
-    agent._fast_mode_unavailable_models = set()
+    # model -> monotonic deadline: Anthropic refused a fast request (429) for the model, so
+    # agent.fast_mode sends it at standard speed until then (inf: the rest of the session).
+    agent._fast_mode_unavailable_models = {}
 
     _init_prompt_cache_config(agent)
     _init_turn_state(agent, run_budget_seconds)

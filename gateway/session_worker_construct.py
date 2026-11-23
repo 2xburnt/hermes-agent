@@ -201,7 +201,9 @@ def worker_route(policy, construct):
     is not the route: a per-model api_mode (opencode-go Responses models) and a resolved endpoint
     (Bedrock's regional URL) come only from resolution. A fallback entry's route belongs to another
     provider and model, so the primary never carries it; the agent's own fallback chain switches them
-    together (#139155).
+    together (#139155). A key-less worker also keeps the primary route's credential pool with its key, so
+    a mid-turn 401 can refresh the matching entry; the pool stays local to construction, never in the
+    serialized policy/bootstrap, and an explicit launch key carries no pool.
 
     A primary AuthError walks the chain the agent will actually get: the owner's per-turn
     ``construct_v1`` chain (an ordinary session's refreshed profile fallbacks) when it was sent,
@@ -220,8 +222,11 @@ def worker_route(policy, construct):
     if (api_mode == 'chat_completions' and runtime.get('provider') != 'custom'
             and not (frozen.get('model') or {}).get('api_mode')):
         api_mode = None
-    return {'api_key': construct['api_key'] or runtime.get('api_key'), 'base_url': runtime.get('base_url'),
-            'api_mode': api_mode}
+    route = {'api_key': construct['api_key'] or runtime.get('api_key'), 'base_url': runtime.get('base_url'),
+             'api_mode': api_mode}
+    if construct['api_key'] is None:
+        route['credential_pool'] = runtime.get('credential_pool')
+    return route
 
 
 def checkpoint_agent_kwargs(config):

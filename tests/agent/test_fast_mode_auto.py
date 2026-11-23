@@ -158,13 +158,14 @@ class _FastRateLimitError(Exception):
 _FAST_KWARGS = {"model": "claude-opus-5", "extra_body": {"speed": "fast"}}
 
 
-def test_unprovisioned_detects_only_zero_limit_fast_429s():
-    assert fast_mode.fast_mode_unprovisioned(_FastRateLimitError("0"), _FAST_KWARGS) is True
-    # A real limit that ran out is transient: the retry-after path handles it.
-    assert fast_mode.fast_mode_unprovisioned(_FastRateLimitError("2000000"), _FAST_KWARGS) is False
+def test_fast_refusal_reads_every_fast_429_as_fast_only():
+    import math
+    assert fast_mode.fast_mode_refusal(_FastRateLimitError("0"), _FAST_KWARGS) == math.inf
+    # A real limit that ran out pauses fast mode for its window (default when no retry-after).
+    assert fast_mode.fast_mode_refusal(_FastRateLimitError("2000000"), _FAST_KWARGS) == 60.0
     # The request has to have asked for fast speed.
-    assert fast_mode.fast_mode_unprovisioned(_FastRateLimitError("0"), {"model": "claude-opus-5"}) is False
-    assert fast_mode.fast_mode_unprovisioned(RuntimeError("boom"), _FAST_KWARGS) is False
+    assert fast_mode.fast_mode_refusal(_FastRateLimitError("0"), {"model": "claude-opus-5"}) is None
+    assert fast_mode.fast_mode_refusal(RuntimeError("boom"), _FAST_KWARGS) is None
 
 
 def test_unavailable_model_drops_speed_for_the_session_and_only_that_model():
@@ -185,12 +186,12 @@ def test_recovery_retries_at_standard_speed_before_classification():
 
     printed = []
     agent = SimpleNamespace(
-        model="claude-opus-5", provider="anthropic", log_prefix="", _fast_mode_unavailable_models=set(),
+        model="claude-opus-5", provider="anthropic", log_prefix="", _fast_mode_unavailable_models={},
         _vprint=lambda *a, **k: printed.append(" ".join(str(x) for x in a)),
     )
     retry, prompt = recover_before_classification(
         agent, _FastRateLimitError("0"), messages=[], api_messages=[], api_kwargs=_FAST_KWARGS, active_system_prompt="sys",
     )
     assert (retry, prompt) == (True, "sys")
-    assert agent._fast_mode_unavailable_models == {"claude-opus-5"}
+    assert list(agent._fast_mode_unavailable_models) == ["claude-opus-5"]
     assert any("standard speed" in line for line in printed)
